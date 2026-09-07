@@ -1,0 +1,76 @@
+name: Build Dynamic Bifrost Image
+
+# 用 transports/Dockerfile.dynamic 构建"动态链接"的 bifrost 镜像并推送到 GHCR。
+#
+# 为什么需要它：Go 插件(.so)只能被"动态链接"的二进制加载。官方 release-pipeline
+# (release-pipeline.yml) 构建的镜像走 -extldflags '-static' + sqlite_static，是静态
+# 链接产物，plugin.Open 会失败；且它只发布到 docker.io/maximhq/bifrost，版本号由
+# transports/version 等文件决定、对已发布的 tag 不会重建。
+#
+# 本 workflow 绕开官方 pipeline：从任意 ref（tag/分支/sha）checkout 源码，用
+# Dockerfile.dynamic 构建动态链接镜像，tag 手动指定，推送到
+# ghcr.io/<owner>/bifrost:<tag>。
+#
+# 用法（GitHub Actions 手动触发）：
+#   - ref:     源码 ref，默认 transports/v1.6.11（对应 Go 1.26.5 一代）。
+#              注意 ref 指向的 commit 上必须已存在 transports/Dockerfile.dynamic。
+#              历史 tag 本身不含该文件，可改用包含它的分支
+#              （如 feature/dynamic-link-plugins），镜像 version 仍手填目标版本。
+#   - version: 镜像 tag，例如 1.6.11-dynamic。也作为 main.Version ldflags 注入。
+#
+# 平台仅 linux/amd64；如需 arm64 自行追加。
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "源码 ref (tag/branch/sha)，其上须存在 transports/Dockerfile.dynamic"
+        required: false
+        default: "feature/dynamic-link-plugins"
+      version:
+        description: "镜像 tag，如 1.6.11-dynamic"
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Verify Dockerfile.dynamic exists
+        run: |
+          test -f transports/Dockerfile.dynamic || {
+            echo "::error::transports/Dockerfile.dynamic not found on ref ${{ inputs.ref }}"
+            echo "The ref must contain the dynamic Dockerfile (e.g. a branch carrying the change)."
+            exit 1
+          }
+
+      - name: Setup Docker Buildx
+        uses: step-security/setup-buildx-action@f931205d68723ad9589fd2a7e2ece238bf9de341 # v4.0.0
+
+      - name: Log in to GitHub Container Registry
+        uses: step-security/docker-login-action@870af644803bf9f204aed474adbad2958fec048b # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: step-security/docker-build-push-action@846549baaf047e867d038826129a64d81df0f704 # v7.1.0
+        with:
+          context: .
+          file: ./transports/Dockerfile.dynamic
+          build-args: |
+            VERSION=${{ inputs.version }}
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ inputs.version }}
+          platforms: linux/amd64
