@@ -16,7 +16,8 @@ name: Build Dynamic Bifrost Image
 #              注意 ref 指向的 commit 上必须已存在 transports/Dockerfile.dynamic。
 #              历史 tag 本身不含该文件，可改用包含它的分支
 #              （如 feature/dynamic-link-plugins），镜像 version 仍手填目标版本。
-#   - version: 镜像 tag，例如 1.6.11-dynamic。也作为 main.Version ldflags 注入。
+#   - version: 版本号，不带 v 前缀，例如 1.6.11-dynamic。镜像 tag 与
+#              main.Version 均由 workflow 加 v 前缀拼成 v<version>。
 #
 # 平台仅 linux/amd64；如需 arm64 自行追加。
 
@@ -28,7 +29,7 @@ on:
         required: false
         default: "feature/dynamic-link-plugins"
       version:
-        description: "镜像 tag，如 1.6.11-dynamic"
+        description: "版本号（不带 v 前缀），如 1.6.11-dynamic。镜像 tag 为 v<version>"
         required: true
 
 permissions:
@@ -72,5 +73,5 @@ jobs:
           build-args: |
             VERSION=${{ inputs.version }}
           push: true
-          tags: ghcr.io/${{ github.repository }}:${{ inputs.version }}
+          tags: ghcr.io/${{ github.repository }}:v${{ inputs.version }}
           platforms: linux/amd64
