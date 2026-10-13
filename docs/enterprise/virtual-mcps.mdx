@@ -38,13 +38,13 @@ Each vMCP's **Access** tab also shows a read-only reverse lookup: the access pro
 - holds an attached virtual key, or
 - belongs to an attached team or customer.
 
-Operators without any of those relationships do not see the vMCP. Attach and detach on an access-profile-managed virtual key are rejected (`409`); attach/detach against a vMCP the operator can't see under DAC returns `404`.
+Operators without any of those relationships do not see the vMCP. Attach and detach on a virtual key whose owner holds an access profile are rejected (`409`); attach/detach against a vMCP the operator can't see under DAC returns `404`.
 
 ---
 
 ## Projects
 
-A [project](/enterprise/access-profiles) can be assigned Virtual MCPs, so a project's members reach the assigned vMCPs. Assignment is managed on the project's MCP access surface and, under a **Restrict** access rule, tools run only through the assigned Virtual MCPs.
+A [project](/enterprise/projects) can be assigned Virtual MCPs, so a project's members reach the assigned vMCPs. Assignment is managed on the project's MCP access surface and, under a **Restrict** access rule, tools run only through the assigned Virtual MCPs.
 
 ---
 

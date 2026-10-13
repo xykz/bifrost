@@ -12,6 +12,8 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Fragment } from "react";
 
+import { getExternalBaseUrl } from "@/app/workspace/mcp-registry/views/mcpUsageGuide/utils";
+import { VirtualKeySelector } from "@/components/entitySelectors/virtualKeySelector";
 import { SheetNavigationButtons } from "@/components/sheetNavigationButtons";
 import { CodeEditor } from "@/components/ui/codeEditor";
 import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
@@ -27,12 +29,18 @@ import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { TriStateCheckbox } from "@/components/ui/tristateCheckbox";
 import { useToast } from "@/hooks/use-toast";
+import { useCopyToClipboard } from "@/hooks/useCopyToClipboard";
 import { useSheetNavigation } from "@/hooks/useSheetNavigation";
 import { IS_ENTERPRISE, MCP_STATUS_COLORS } from "@/lib/constants/config";
-import { VirtualKeySelector } from "@/components/entitySelectors/virtualKeySelector";
-import { getErrorMessage, useGetCoreConfigQuery, useGetVirtualKeysQuery, useUpdateMCPClientMutation } from "@/lib/store";
+import {
+	getErrorMessage,
+	useGetCoreConfigQuery,
+	useGetVirtualMCPsQuery,
+	useUpdateMCPClientMutation
+} from "@/lib/store";
 import { MCPClient, MCPVKConfig } from "@/lib/types/mcp";
 import { mcpClientUpdateSchema, type MCPClientUpdateSchema } from "@/lib/types/schemas";
+import { VirtualMCP } from "@/lib/types/virtualMcps";
 import { parseArrayFromText } from "@/lib/utils/array";
 import { failureStageLabel, formatDurationSince, hasStateReason, stateReasonTitle } from "@/lib/utils/mcpConnectionFailure";
 import { titleCaseFromSnakeCase } from "@/lib/utils/strings";
@@ -40,14 +48,11 @@ import { RbacOperation, RbacResource, useRbac } from "@enterprise/lib";
 import { useGetSCIMProvidersQuery } from "@enterprise/lib/store/apis/scimApi";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Check, ChevronDown, ChevronRight, Copy, Info, Plus, Trash2 } from "lucide-react";
-import { useCopyToClipboard } from "@/hooks/useCopyToClipboard";
-import { getExternalBaseUrl } from "@/app/workspace/mcp-registry/views/mcpUsageGuide/utils";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useForm } from "react-hook-form";
-import { OAuthAdvancedFields } from "./oauthAdvancedFields";
-import { OAuth2Authorizer } from "./oauth2Authorizer";
 import { MCPClientCredentialSection, MCPClientSessionsSection } from "./mcpClientCredentialSection";
 import { ConnectionFailureBlock } from "./mcpConnectionFailure";
+import { OAuthAdvancedFields } from "./oauthAdvancedFields";
 import { SectionHeader } from "./sectionHeader";
 import { TLSConfigFields } from "./tlsConfigFields";
 import { TokenExchangeFields } from "./tokenExchangeFields";
@@ -174,6 +179,7 @@ export default function MCPClientSheet({
 	const { data: bifrostConfig } = useGetCoreConfigQuery({ fromDB: true });
 	const globalToolSyncInterval = bifrostConfig?.client_config?.mcp_tool_sync_interval ?? 10;
 	const globalToolExecutionTimeout = bifrostConfig?.client_config?.mcp_tool_execution_timeout ?? 30;
+	const globalMaxInstructionsLength = bifrostConfig?.client_config?.mcp_max_instructions_per_client || 4096;
 	// External base URL + copy for the read-only endpoint the client is served at (/mcp/<slug>).
 	const baseUrl = getExternalBaseUrl(bifrostConfig?.client_config);
 	const { copy: copyEndpoint, copied: endpointCopied } = useCopyToClipboard({ successMessage: "Endpoint copied" });
@@ -230,6 +236,20 @@ export default function MCPClientSheet({
 	}, [mcpClient.vk_configs, localVKNames]);
 
 	const configuredVKIDs = useMemo(() => vkConfigs.map((vc) => vc.virtual_key_id), [vkConfigs]);
+
+	// Reverse lookup for the Access tab: which Virtual MCPs bundle this server's
+	// tools. There's no dedicated endpoint, but the list response already carries
+	// every vMCP's tools[].mcp_client_id, so membership is derived client-side.
+	const { data: virtualMcpsData, isLoading: virtualMcpsLoading, isError: virtualMcpsError } = useGetVirtualMCPsQuery({ limit: 1000 });
+	const memberVirtualMcps = useMemo(() => {
+		const clientID = mcpClient.config.client_id;
+		const out: { vmcp: VirtualMCP; toolNames: string[] }[] = [];
+		for (const vmcp of virtualMcpsData?.virtual_mcps ?? []) {
+			const spec = vmcp.tools.find((t) => t.mcp_client_id === clientID);
+			if (spec) out.push({ vmcp, toolNames: spec.tool_names });
+		}
+		return out;
+	}, [virtualMcpsData, mcpClient.config.client_id]);
 
 	const toolOptions = useMemo(
 		() => [
@@ -296,16 +316,17 @@ export default function MCPClientSheet({
 			tool_pricing: mcpClient.config.tool_pricing || {},
 			tool_sync_interval: toolSyncIntervalToMinutes(mcpClient.config.tool_sync_interval),
 			tool_execution_timeout: toolExecutionTimeoutToSeconds(mcpClient.config.tool_execution_timeout),
+			max_instructions_length: mcpClient.config.max_instructions_length ?? 0,
 			allowed_extra_headers: mcpClient.config.allowed_extra_headers || [],
 			oauth_config: supportsOAuthCredentialUpdate
 				? {
-						client_id: mcpClient.config.oauth_client_id,
-						client_secret: mcpClient.config.oauth_client_secret,
-						authorize_url: mcpClient.config.oauth_authorize_url,
-						token_url: mcpClient.config.oauth_token_url,
-						registration_url: mcpClient.config.oauth_registration_url,
-						resource: mcpClient.config.oauth_resource,
-					}
+					client_id: mcpClient.config.oauth_client_id,
+					client_secret: mcpClient.config.oauth_client_secret,
+					authorize_url: mcpClient.config.oauth_authorize_url,
+					token_url: mcpClient.config.oauth_token_url,
+					registration_url: mcpClient.config.oauth_registration_url,
+					resource: mcpClient.config.oauth_resource,
+				}
 				: undefined,
 			// Unlike oauth_config, token_exchange is replaced wholesale server-side
 			// (only client_id/client_secret get redacted-value preservation) — so
@@ -313,18 +334,18 @@ export default function MCPClientSheet({
 			// with its current stored value rather than left blank.
 			token_exchange: supportsTokenExchangeCredentialUpdate
 				? {
-						audience: mcpClient.config.token_exchange?.audience,
-						use_idp_credentials: mcpClient.config.token_exchange?.use_idp_credentials,
-						client_id: mcpClient.config.token_exchange?.client_id,
-						client_secret: mcpClient.config.token_exchange?.client_secret,
-						authorization_server_url: mcpClient.config.token_exchange?.authorization_server_url,
-					}
+					audience: mcpClient.config.token_exchange?.audience,
+					use_idp_credentials: mcpClient.config.token_exchange?.use_idp_credentials,
+					client_id: mcpClient.config.token_exchange?.client_id,
+					client_secret: mcpClient.config.token_exchange?.client_secret,
+					authorization_server_url: mcpClient.config.token_exchange?.authorization_server_url,
+				}
 				: undefined,
 			tls_config: mcpClient.config.tls_config
 				? {
-						insecure_skip_verify: mcpClient.config.tls_config.insecure_skip_verify,
-						ca_cert_pem: mcpClient.config.tls_config.ca_cert_pem,
-					}
+					insecure_skip_verify: mcpClient.config.tls_config.insecure_skip_verify,
+					ca_cert_pem: mcpClient.config.tls_config.ca_cert_pem,
+				}
 				: undefined,
 		},
 	});
@@ -347,16 +368,17 @@ export default function MCPClientSheet({
 			tool_pricing: mcpClient.config.tool_pricing || {},
 			tool_sync_interval: toolSyncIntervalToMinutes(mcpClient.config.tool_sync_interval),
 			tool_execution_timeout: toolExecutionTimeoutToSeconds(mcpClient.config.tool_execution_timeout),
+			max_instructions_length: mcpClient.config.max_instructions_length ?? 0,
 			allowed_extra_headers: mcpClient.config.allowed_extra_headers || [],
 			oauth_config: supportsOAuthCredentialUpdate
 				? {
-						client_id: mcpClient.config.oauth_client_id,
-						client_secret: mcpClient.config.oauth_client_secret,
-						authorize_url: mcpClient.config.oauth_authorize_url,
-						token_url: mcpClient.config.oauth_token_url,
-						registration_url: mcpClient.config.oauth_registration_url,
-						resource: mcpClient.config.oauth_resource,
-					}
+					client_id: mcpClient.config.oauth_client_id,
+					client_secret: mcpClient.config.oauth_client_secret,
+					authorize_url: mcpClient.config.oauth_authorize_url,
+					token_url: mcpClient.config.oauth_token_url,
+					registration_url: mcpClient.config.oauth_registration_url,
+					resource: mcpClient.config.oauth_resource,
+				}
 				: undefined,
 			// Unlike oauth_config, token_exchange is replaced wholesale server-side
 			// (only client_id/client_secret get redacted-value preservation) — so
@@ -364,18 +386,18 @@ export default function MCPClientSheet({
 			// with its current stored value rather than left blank.
 			token_exchange: supportsTokenExchangeCredentialUpdate
 				? {
-						audience: mcpClient.config.token_exchange?.audience,
-						use_idp_credentials: mcpClient.config.token_exchange?.use_idp_credentials,
-						client_id: mcpClient.config.token_exchange?.client_id,
-						client_secret: mcpClient.config.token_exchange?.client_secret,
-						authorization_server_url: mcpClient.config.token_exchange?.authorization_server_url,
-					}
+					audience: mcpClient.config.token_exchange?.audience,
+					use_idp_credentials: mcpClient.config.token_exchange?.use_idp_credentials,
+					client_id: mcpClient.config.token_exchange?.client_id,
+					client_secret: mcpClient.config.token_exchange?.client_secret,
+					authorization_server_url: mcpClient.config.token_exchange?.authorization_server_url,
+				}
 				: undefined,
 			tls_config: mcpClient.config.tls_config
 				? {
-						insecure_skip_verify: mcpClient.config.tls_config.insecure_skip_verify,
-						ca_cert_pem: mcpClient.config.tls_config.ca_cert_pem,
-					}
+					insecure_skip_verify: mcpClient.config.tls_config.insecure_skip_verify,
+					ca_cert_pem: mcpClient.config.tls_config.ca_cert_pem,
+				}
 				: undefined,
 		});
 	}, [form, mcpClient, supportsOAuthCredentialUpdate, supportsTokenExchangeCredentialUpdate]);
@@ -454,9 +476,9 @@ export default function MCPClientSheet({
 				? undefined
 				: oauthScopesRaw.trim()
 					? oauthScopesRaw
-							.split(",")
-							.map((s) => s.trim())
-							.filter(Boolean)
+						.split(",")
+						.map((s) => s.trim())
+						.filter(Boolean)
 					: [];
 			// Only rotate when the user actually changed a field, and never
 			// alongside a disable (the backend rejects that combination
@@ -473,9 +495,9 @@ export default function MCPClientSheet({
 			const shouldUpdateTokenExchange = supportsTokenExchangeCredentialUpdate && tokenExchangeCredentialsDirty;
 			const tokenExchangeScopes = tokenExchangeScopesRaw.trim()
 				? tokenExchangeScopesRaw
-						.split(",")
-						.map((s) => s.trim())
-						.filter(Boolean)
+					.split(",")
+					.map((s) => s.trim())
+					.filter(Boolean)
 				: [];
 			await updateMCPClient({
 				id: mcpClient.config.client_id,
@@ -500,36 +522,37 @@ export default function MCPClientSheet({
 					// unrelated edit would silently rewrite it.
 					tool_sync_interval: form.formState.dirtyFields.tool_sync_interval ? (data.tool_sync_interval ?? 0) : undefined,
 					tool_execution_timeout: data.tool_execution_timeout ?? 0,
+					max_instructions_length: data.max_instructions_length ?? 0,
 					allowed_extra_headers: data.allowed_extra_headers,
 					oauth_config: shouldRotateOAuthCredentials
 						? {
-								client_id: oauthClientID,
-								client_secret: oauthClientSecret,
-								authorize_url: data.oauth_config?.authorize_url || undefined,
-								token_url: data.oauth_config?.token_url || undefined,
-								registration_url: data.oauth_config?.registration_url || undefined,
-								scopes: oauthScopes,
-								resource: data.oauth_config?.resource || undefined,
-							}
+							client_id: oauthClientID,
+							client_secret: oauthClientSecret,
+							authorize_url: data.oauth_config?.authorize_url || undefined,
+							token_url: data.oauth_config?.token_url || undefined,
+							registration_url: data.oauth_config?.registration_url || undefined,
+							scopes: oauthScopes,
+							resource: data.oauth_config?.resource || undefined,
+						}
 						: undefined,
 					token_exchange: shouldUpdateTokenExchange
 						? {
-								audience: data.token_exchange?.audience?.trim() || "",
-								use_idp_credentials: data.token_exchange?.use_idp_credentials ?? false,
-								client_id: data.token_exchange?.use_idp_credentials
-									? undefined
-									: (data.token_exchange?.client_id ?? { value: "", ref: "" }),
-								client_secret: data.token_exchange?.use_idp_credentials ? undefined : data.token_exchange?.client_secret,
-								authorization_server_url: data.token_exchange?.authorization_server_url?.trim() || undefined,
-								scopes: tokenExchangeScopes,
-							}
+							audience: data.token_exchange?.audience?.trim() || "",
+							use_idp_credentials: data.token_exchange?.use_idp_credentials ?? false,
+							client_id: data.token_exchange?.use_idp_credentials
+								? undefined
+								: (data.token_exchange?.client_id ?? { value: "", ref: "" }),
+							client_secret: data.token_exchange?.use_idp_credentials ? undefined : data.token_exchange?.client_secret,
+							authorization_server_url: data.token_exchange?.authorization_server_url?.trim() || undefined,
+							scopes: tokenExchangeScopes,
+						}
 						: undefined,
 					tls_config:
 						data.tls_config !== undefined
 							? {
-									insecure_skip_verify: data.tls_config.insecure_skip_verify ?? false,
-									ca_cert_pem: data.tls_config.ca_cert_pem,
-								}
+								insecure_skip_verify: data.tls_config.insecure_skip_verify ?? false,
+								ca_cert_pem: data.tls_config.ca_cert_pem,
+							}
 							: undefined,
 					vk_configs: vkConfigsDirty ? vkConfigs : undefined,
 				},
@@ -757,7 +780,7 @@ export default function MCPClientSheet({
 													<span className="font-mono break-all">
 														{mcpClient.config.connection_type === "stdio"
 															? `${mcpClient.config.stdio_config?.command ?? ""} ${(mcpClient.config.stdio_config?.args ?? []).join(" ")}`.trim() ||
-																"-"
+															"-"
 															: mcpClient.config.connection_string?.type === "env" || mcpClient.config.connection_string?.type === "vault"
 																? mcpClient.config.connection_string.ref
 																: mcpClient.config.connection_string?.value || "-"}
@@ -793,7 +816,7 @@ export default function MCPClientSheet({
 																	return [name, valueParts.join("=")];
 																}),
 															)}
-															onChange={() => {}}
+															onChange={() => { }}
 															fixedKeys={mcpClient.config.stdio_config.envs.map((env) => env.split("=")[0])}
 															valuePlaceholder="—"
 															label=""
@@ -930,7 +953,7 @@ export default function MCPClientSheet({
 										<div className="space-y-4">
 											<SectionHeader
 												title="Sync & Timeouts"
-												description="Override the global tool sync interval and execution timeout for this server."
+												description="Override the global tool sync interval, execution timeout and instruction limit for this server."
 											/>
 											<div className="divide-y rounded-md border">
 												<FormField
@@ -1023,6 +1046,58 @@ export default function MCPClientSheet({
 																		min="0"
 																		step="1"
 																		data-testid="mcp-tool-execution-timeout"
+																	/>
+																</FormControl>
+															</FormItem>
+														);
+													}}
+												/>
+												<FormField
+													control={form.control}
+													name="max_instructions_length"
+													render={({ field }) => {
+														const isUsingGlobal = field.value === undefined || field.value === null || field.value === 0;
+														return (
+															<FormItem className="flex flex-row items-center justify-between gap-4 px-4 py-3">
+																<div className="flex flex-col items-start gap-0.5">
+																	<div className="flex items-start gap-2">
+																		<div>
+																			<FormLabel>Max Instruction Length (bytes)</FormLabel>
+																		</div>
+																		<TooltipProvider>
+																			<Tooltip>
+																				<TooltipTrigger asChild>
+																					<Info className="text-muted-foreground h-4 w-4 cursor-help" />
+																				</TooltipTrigger>
+																				<TooltipContent className="max-w-xs">
+																					<p>
+																						Cap on the instructions forwarded from this server. Leave empty or set to 0 to use the global
+																						setting. The combined total across all servers is still bounded by the global total.
+																					</p>
+																				</TooltipContent>
+																			</Tooltip>
+																		</TooltipProvider>
+																	</div>
+																	<div>{isUsingGlobal && <p className="text-muted-foreground text-xs">Using global setting</p>}</div>
+																</div>
+																<FormControl>
+																	<Input
+																		type="number"
+																		className={`w-24 ${isUsingGlobal ? "text-muted-foreground" : ""}`}
+																		placeholder={String(globalMaxInstructionsLength)}
+																		value={field.value === 0 || field.value === undefined ? "" : String(field.value)}
+																		onChange={(e) => {
+																			if (e.target.value === "") {
+																				field.onChange(undefined);
+																				return;
+																			}
+																			const n = Number(e.target.value);
+																			if (!Number.isInteger(n)) return;
+																			field.onChange(n);
+																		}}
+																		min="0"
+																		step="1"
+																		data-testid="mcp-max-instructions-length"
 																	/>
 																</FormControl>
 															</FormItem>
@@ -1171,9 +1246,9 @@ export default function MCPClientSheet({
 																onBlur={() => {
 																	const parsed = allowedExtraHeadersRaw.trim()
 																		? allowedExtraHeadersRaw
-																				.split(",")
-																				.map((h) => h.trim())
-																				.filter(Boolean)
+																			.split(",")
+																			.map((h) => h.trim())
+																			.filter(Boolean)
 																		: [];
 																	field.onChange(parsed);
 																	field.onBlur();
@@ -1798,6 +1873,60 @@ export default function MCPClientSheet({
 											) : (
 												<div className="text-muted-foreground rounded-sm border p-6 text-center">
 													<p className="text-sm">No virtual keys have access to this MCP server</p>
+												</div>
+											)}
+										</div>
+
+										<DottedSeparator />
+
+										<div className="space-y-4">
+											<SectionHeader
+												title="Virtual MCPs"
+												description="Virtual MCPs that bundle this server's tools and re-serve them at their own endpoint."
+											/>
+											{virtualMcpsLoading ? (
+												<div className="text-muted-foreground rounded-sm border p-6 text-center">
+													<p className="text-sm">Loading virtual MCPs…</p>
+												</div>
+											) : virtualMcpsError ? (
+												<div className="text-muted-foreground rounded-sm border p-6 text-center">
+													<p className="text-sm">Couldn't load virtual MCPs.</p>
+												</div>
+											) : memberVirtualMcps.length > 0 ? (
+												<div className="rounded-md border">
+													<Table>
+														<TableHeader>
+															<TableRow>
+																<TableHead>Virtual MCP</TableHead>
+																<TableHead>Endpoint</TableHead>
+																<TableHead>Exposed Tools</TableHead>
+															</TableRow>
+														</TableHeader>
+														<TableBody>
+															{memberVirtualMcps.map(({ vmcp, toolNames }) => (
+																<TableRow key={vmcp.id}>
+																	<TableCell className="font-medium">
+																		<div className="flex items-center gap-2">
+																			{vmcp.name}
+																			{!vmcp.enabled && (
+																				<Badge variant="secondary" className="text-xs font-normal">
+																					Disabled
+																				</Badge>
+																			)}
+																		</div>
+																	</TableCell>
+																	<TableCell className="text-muted-foreground font-mono text-xs">/mcp/{vmcp.endpoint_slug}</TableCell>
+																	<TableCell className="text-muted-foreground text-sm">
+																		{toolNames.includes("*") ? "All tools" : toolNames.length === 0 ? "No tools" : toolNames.join(", ")}
+																	</TableCell>
+																</TableRow>
+															))}
+														</TableBody>
+													</Table>
+												</div>
+											) : (
+												<div className="text-muted-foreground rounded-sm border p-6 text-center">
+													<p className="text-sm">This server isn't part of any virtual MCP.</p>
 												</div>
 											)}
 										</div>
