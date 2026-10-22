@@ -17,7 +17,7 @@ import (
 
 // oauthKeyCacheVersion namespaces cache keys derived from an OAuthKeyConfig. Bump it when the
 // set of hashed fields changes.
-const oauthKeyCacheVersion = "oauthkey-v1"
+const oauthKeyCacheVersion = "oauthkey-v2"
 
 // ResolveBearer is the one entry point for bearer auth on a key that may be static or minted.
 // value is Key.Value; when set it is used verbatim. When it is empty and cfg is nil the result
@@ -107,8 +107,10 @@ func MinterForConfig(cfg *schemas.OAuthKeyConfig, hc *http.Client) (string, Mint
 			ExtraParams:   extraParams(cfg.ExtraParams),
 		}, hc)
 		return cacheKey, mint, nil
+	case schemas.OAuthGrantBrowserLogin:
+		return cacheKey, BrowserLoginMinter(cfg, hc, nil), nil
 	default:
-		return "", nil, configurationError("oauth_key_config.grant_type must be client_credentials or jwt_bearer")
+		return "", nil, configurationError("oauth_key_config.grant_type must be client_credentials, jwt_bearer or browser_login")
 	}
 }
 
@@ -135,10 +137,14 @@ func validateConfig(cfg *schemas.OAuthKeyConfig) (string, *schemas.BifrostError)
 		if secret(cfg.PrivateKey) == "" || strings.TrimSpace(cfg.Issuer) == "" || strings.TrimSpace(cfg.Audience) == "" {
 			return "", configurationError("oauth_key_config.private_key, oauth_key_config.issuer and oauth_key_config.audience are required for the jwt_bearer grant")
 		}
+	case schemas.OAuthGrantBrowserLogin:
+		if secret(cfg.RefreshToken) == "" {
+			return "", configurationError("oauth_key_config.refresh_token is required for the browser_login grant")
+		}
 	case "":
 		return "", configurationError("oauth_key_config.grant_type is required")
 	default:
-		return "", configurationError("oauth_key_config.grant_type must be client_credentials or jwt_bearer")
+		return "", configurationError("oauth_key_config.grant_type must be client_credentials, jwt_bearer or browser_login")
 	}
 	return oauthKeyCacheKey(cfg, tokenURL), nil
 }
@@ -201,6 +207,7 @@ func oauthKeyCacheKey(cfg *schemas.OAuthKeyConfig, tokenURL string) string {
 		secret(cfg.ClientID),
 		secret(cfg.ClientSecret),
 		secret(cfg.PrivateKey),
+		secret(cfg.RefreshToken),
 		cfg.Issuer,
 		cfg.Subject,
 		cfg.Audience,

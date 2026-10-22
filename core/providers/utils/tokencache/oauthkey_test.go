@@ -2,8 +2,13 @@ package tokencache
 
 import (
 	"context"
+	"io"
 	"net/http"
+	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	schemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/stretchr/testify/assert"
@@ -96,7 +101,7 @@ func TestMinterForConfig(t *testing.T) {
 		{"ftp token url", func(c *schemas.OAuthKeyConfig) { c.TokenURL = *schemas.NewSecretVar("ftp://x/token") }, "must be https"},
 		{"plain http on a public host", func(c *schemas.OAuthKeyConfig) { c.TokenURL = *schemas.NewSecretVar("http://idp.example/oauth2/token") }, "must be https"},
 		{"missing grant", func(c *schemas.OAuthKeyConfig) { c.GrantType = "" }, "grant_type is required"},
-		{"unknown grant", func(c *schemas.OAuthKeyConfig) { c.GrantType = "password" }, "must be client_credentials or jwt_bearer"},
+		{"unknown grant", func(c *schemas.OAuthKeyConfig) { c.GrantType = "password" }, "must be client_credentials, jwt_bearer or browser_login"},
 		{"jwt bearer without key", func(c *schemas.OAuthKeyConfig) {
 			c.GrantType = schemas.OAuthGrantJWTBearer
 			c.Issuer = "i"
@@ -114,6 +119,10 @@ func TestMinterForConfig(t *testing.T) {
 		}, "signing_algorithm must be one of"},
 		{"missing client id", func(c *schemas.OAuthKeyConfig) { c.ClientID = schemas.NewSecretVar("") }, "client_id and oauth_key_config.client_secret are required"},
 		{"bad auth style", func(c *schemas.OAuthKeyConfig) { c.AuthStyle = "query" }, "auth_style must be header or body"},
+		{"browser login without a refresh token", func(c *schemas.OAuthKeyConfig) {
+			c.GrantType = schemas.OAuthGrantBrowserLogin
+			c.RefreshToken = nil
+		}, "refresh_token is required for the browser_login grant"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var cfg *schemas.OAuthKeyConfig
@@ -255,6 +264,21 @@ func TestOAuthKeyCacheKey(t *testing.T) {
 	t.Run("the key never contains the secret", func(t *testing.T) {
 		assert.NotContains(t, ref, "secret")
 	})
+
+	t.Run("browser_login keys are distinguished by their refresh token", func(t *testing.T) {
+		// Two browser sessions for the same endpoint must never share a cache slot: the
+		// second one's access token would be served on the first one's behalf.
+		browser := func(refresh string) *schemas.OAuthKeyConfig {
+			return &schemas.OAuthKeyConfig{
+				GrantType:    schemas.OAuthGrantBrowserLogin,
+				TokenURL:     *schemas.NewSecretVar("https://api.example/refresh"),
+				RefreshToken: schemas.NewSecretVar(refresh),
+			}
+		}
+		first := key(browser("refresh-1"))
+		assert.NotEqual(t, first, key(browser("refresh-2")))
+		assert.NotContains(t, first, "refresh-1")
+	})
 }
 
 func TestDatabricksOAuthConfig(t *testing.T) {
@@ -282,4 +306,205 @@ func TestDatabricksOAuthConfig(t *testing.T) {
 		_, ok = (&schemas.DatabricksKeyConfig{ClientID: schemas.NewSecretVar("sp"), ClientSecret: schemas.NewSecretVar("")}).OAuthConfig("h")
 		assert.False(t, ok)
 	})
+}
+
+func TestBrowserLoginMinterRefreshesAndRotates(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		require.Equal(t, "POST", r.Method)
+		// The refresh token travels in the header, never the body.
+		require.Equal(t, "refresh-1", r.Header.Get("X-Refresh-Token"))
+		require.Equal(t, "SaaS", r.Header.Get("X-Product"))
+		body, _ := io.ReadAll(r.Body)
+		require.JSONEq(t, "{}", string(body))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"accessToken":"access-2","refreshToken":"refresh-2","expiresIn":3600}}`))
+	}))
+	defer srv.Close()
+
+	cfg := &schemas.OAuthKeyConfig{
+		GrantType:    schemas.OAuthGrantBrowserLogin,
+		TokenURL:     *schemas.NewSecretVar(srv.URL),
+		RefreshToken: schemas.NewSecretVar("refresh-1"),
+	}
+	cache := New[string](Options{})
+	headers, bErr := ResolveBearerFrom(context.Background(), cache, *cfg, srv.Client())
+	require.Nil(t, bErr)
+	require.Equal(t, "Bearer access-2", headers["Authorization"])
+	require.EqualValues(t, 1, calls.Load())
+
+	// A second call within the token's lifetime must not hit the network.
+	_, bErr = ResolveBearerFrom(context.Background(), cache, *cfg, srv.Client())
+	require.Nil(t, bErr)
+	require.EqualValues(t, 1, calls.Load(), "warm token must not re-refresh")
+}
+
+func TestBrowserLoginMinterDeadRefreshTokenIsPermanent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"code":12153,"msg":"refresh token expired"}`))
+	}))
+	defer srv.Close()
+
+	cfg := &schemas.OAuthKeyConfig{
+		GrantType:    schemas.OAuthGrantBrowserLogin,
+		TokenURL:     *schemas.NewSecretVar(srv.URL),
+		RefreshToken: schemas.NewSecretVar("dead"),
+	}
+	_, bErr := ResolveBearerFrom(context.Background(), New[string](Options{}), *cfg, srv.Client())
+	require.NotNil(t, bErr)
+	require.NotNil(t, bErr.StatusCode, "a dead refresh token must be reported with a status")
+	require.Equal(t, http.StatusUnauthorized, *bErr.StatusCode)
+	require.NotNil(t, bErr.AllowFallbacks, "a dead credential must not fall back")
+	require.False(t, *bErr.AllowFallbacks, "a dead credential must not fall back")
+	require.Contains(t, bErr.Error.Message, "re-authenticate")
+}
+
+func TestBrowserLoginMinterRotateAndTiming(t *testing.T) {
+	serve := func(t *testing.T, body string) *httptest.Server {
+		t.Helper()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			require.Equal(t, "application/json", r.Header.Get("Content-Type"))
+			require.Equal(t, "application/json", r.Header.Get("Accept"))
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(body))
+		}))
+		t.Cleanup(srv.Close)
+		return srv
+	}
+
+	t.Run("reports the rotated refresh token through onRotate", func(t *testing.T) {
+		srv := serve(t, `{"code":0,"data":{"accessToken":"access-2","refreshToken":"refresh-2","expiresIn":3600}}`)
+		cfg := &schemas.OAuthKeyConfig{
+			GrantType:    schemas.OAuthGrantBrowserLogin,
+			TokenURL:     *schemas.NewSecretVar(srv.URL),
+			RefreshToken: schemas.NewSecretVar("refresh-1"),
+		}
+		var gotAccess, gotRefresh string
+		var gotExpiry time.Time
+		mint := BrowserLoginMinter(cfg, srv.Client(), func(accessToken, refreshToken string, expiresAt time.Time) {
+			gotAccess, gotRefresh, gotExpiry = accessToken, refreshToken, expiresAt
+		})
+		e, bErr := mint(context.Background(), nil)
+		require.Nil(t, bErr)
+		require.Equal(t, "access-2", e.Value)
+		assert.Equal(t, "access-2", gotAccess)
+		assert.Equal(t, "refresh-2", gotRefresh, "a rotated refresh token must reach the callback")
+		assert.WithinDuration(t, e.ExpiresAt, gotExpiry, time.Second)
+		// The cache must mint a minute before upstream expiry, not after it.
+		assert.WithinDuration(t, time.Now().Add(time.Hour), e.ExpiresAt, 5*time.Second)
+		assert.Equal(t, e.ExpiresAt.Add(-DefaultRefreshMargin), e.RefreshAt)
+	})
+
+	t.Run("a response without a rotated token keeps the original", func(t *testing.T) {
+		srv := serve(t, `{"code":0,"data":{"accessToken":"access-2","expiresIn":3600}}`)
+		cfg := &schemas.OAuthKeyConfig{
+			GrantType:    schemas.OAuthGrantBrowserLogin,
+			TokenURL:     *schemas.NewSecretVar(srv.URL),
+			RefreshToken: schemas.NewSecretVar("refresh-1"),
+		}
+		var gotRefresh string
+		mint := BrowserLoginMinter(cfg, srv.Client(), func(_, refreshToken string, _ time.Time) {
+			gotRefresh = refreshToken
+		})
+		_, bErr := mint(context.Background(), nil)
+		require.Nil(t, bErr)
+		assert.Equal(t, "refresh-1", gotRefresh)
+	})
+
+	t.Run("a missing expires_in falls back to two minutes", func(t *testing.T) {
+		// An unreported lifetime must not pin a token the endpoint considers dead.
+		srv := serve(t, `{"code":0,"data":{"accessToken":"access-2","refreshToken":"refresh-2"}}`)
+		cfg := &schemas.OAuthKeyConfig{
+			GrantType:    schemas.OAuthGrantBrowserLogin,
+			TokenURL:     *schemas.NewSecretVar(srv.URL),
+			RefreshToken: schemas.NewSecretVar("refresh-1"),
+		}
+		e, bErr := BrowserLoginMinter(cfg, srv.Client(), nil)(context.Background(), nil)
+		require.Nil(t, bErr)
+		assert.WithinDuration(t, time.Now().Add(2*time.Minute), e.ExpiresAt, 5*time.Second)
+		assert.Equal(t, e.ExpiresAt.Add(-DefaultRefreshMargin), e.RefreshAt)
+	})
+
+	t.Run("a non-positive expires_in falls back to two minutes", func(t *testing.T) {
+		srv := serve(t, `{"code":0,"data":{"accessToken":"access-2","expiresIn":-1}}`)
+		cfg := &schemas.OAuthKeyConfig{
+			GrantType:    schemas.OAuthGrantBrowserLogin,
+			TokenURL:     *schemas.NewSecretVar(srv.URL),
+			RefreshToken: schemas.NewSecretVar("refresh-1"),
+		}
+		e, bErr := BrowserLoginMinter(cfg, srv.Client(), nil)(context.Background(), nil)
+		require.Nil(t, bErr)
+		assert.WithinDuration(t, time.Now().Add(2*time.Minute), e.ExpiresAt, 5*time.Second)
+	})
+
+	t.Run("an unknown refusal is transient, not a dead credential", func(t *testing.T) {
+		// Only 401 and code 12153 mean the refresh token is gone. Anything else must leave
+		// fallbacks open so a temporary endpoint fault does not take the lane down.
+		srv := serve(t, `{"code":500,"msg":"upstream busy"}`)
+		cfg := &schemas.OAuthKeyConfig{
+			GrantType:    schemas.OAuthGrantBrowserLogin,
+			TokenURL:     *schemas.NewSecretVar(srv.URL),
+			RefreshToken: schemas.NewSecretVar("refresh-1"),
+		}
+		_, bErr := BrowserLoginMinter(cfg, srv.Client(), nil)(context.Background(), nil)
+		require.NotNil(t, bErr)
+		assert.Nil(t, bErr.AllowFallbacks, "an unknown refusal must leave fallbacks open")
+		assert.Contains(t, bErr.Error.Message, "upstream busy")
+	})
+
+	t.Run("a 2xx without an access token is not a success", func(t *testing.T) {
+		srv := serve(t, `{"code":0,"data":{"refreshToken":"refresh-2"}}`)
+		cfg := &schemas.OAuthKeyConfig{
+			GrantType:    schemas.OAuthGrantBrowserLogin,
+			TokenURL:     *schemas.NewSecretVar(srv.URL),
+			RefreshToken: schemas.NewSecretVar("refresh-1"),
+		}
+		_, bErr := BrowserLoginMinter(cfg, srv.Client(), nil)(context.Background(), nil)
+		require.NotNil(t, bErr)
+		assert.Contains(t, bErr.Error.Message, "no access_token")
+	})
+
+	t.Run("a rejection never echoes the refresh token", func(t *testing.T) {
+		srv := serve(t, `{"code":12153,"msg":"token refresh-1 is expired"}`)
+		cfg := &schemas.OAuthKeyConfig{
+			GrantType:    schemas.OAuthGrantBrowserLogin,
+			TokenURL:     *schemas.NewSecretVar(srv.URL),
+			RefreshToken: schemas.NewSecretVar("refresh-1"),
+		}
+		_, bErr := BrowserLoginMinter(cfg, srv.Client(), nil)(context.Background(), nil)
+		require.NotNil(t, bErr)
+		assert.NotContains(t, bErr.Error.Message, "refresh-1")
+	})
+}
+
+func TestBrowserLoginMinterConcurrentCallersRefreshOnce(t *testing.T) {
+	var calls atomic.Int32
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		<-release // hold the first exchange open so the others pile up behind it
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"accessToken":"access-x","refreshToken":"refresh-x","expiresIn":3600}}`))
+	}))
+	defer srv.Close()
+	cfg := schemas.OAuthKeyConfig{
+		GrantType:    schemas.OAuthGrantBrowserLogin,
+		TokenURL:     *schemas.NewSecretVar(srv.URL),
+		RefreshToken: schemas.NewSecretVar("refresh-0"),
+	}
+	cache := New[string](Options{})
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = ResolveBearerFrom(context.Background(), cache, cfg, srv.Client())
+		}()
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	wg.Wait()
+	require.EqualValues(t, 1, calls.Load(), "concurrent callers must share one refresh")
 }

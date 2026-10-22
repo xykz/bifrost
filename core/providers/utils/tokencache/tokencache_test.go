@@ -634,7 +634,7 @@ func BenchmarkGetWarm(b *testing.B) {
 func BenchmarkCacheKey(b *testing.B) {
 	b.ReportAllocs()
 	for range b.N {
-		_ = CacheKey("oauthkey-v1", "client_credentials", "https://login.example.com/oauth2/v2.0/token",
-			"client-id", "a-long-client-secret-value-0123456789", "", "", "", "api://audience", "", "", "header", "scope-a scope-b", "")
+		_ = CacheKey("oauthkey-v2", "client_credentials", "https://login.example.com/oauth2/v2.0/token",
+			"client-id", "a-long-client-secret-value-0123456789", "", "", "", "", "api://audience", "", "", "header", "scope-a scope-b", "")
 	}
 }
