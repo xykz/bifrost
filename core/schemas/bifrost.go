@@ -52,6 +52,7 @@ const (
 	Bedrock       ModelProvider = "bedrock"
 	BedrockMantle ModelProvider = "bedrock_mantle"
 	Cohere        ModelProvider = "cohere"
+	CodeBuddyCN   ModelProvider = "codebuddy-cn"
 	Vertex        ModelProvider = "vertex"
 	Mistral       ModelProvider = "mistral"
 	Ollama        ModelProvider = "ollama"
@@ -102,6 +103,7 @@ var StandardProviders = []ModelProvider{
 	BedrockMantle,
 	Cerebras,
 	Cohere,
+	CodeBuddyCN,
 	DeepSeek,
 	Gemini,
 	Groq,

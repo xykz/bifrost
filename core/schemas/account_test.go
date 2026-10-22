@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestAliasConfigRedactedPreservesShape(t *testing.T) {
@@ -797,4 +799,60 @@ func TestApplyRequestRouting(t *testing.T) {
 	var nilInfo *RoutingInfo
 	nilInfo.ApplyRequestRouting(ctx)
 	(&RoutingInfo{}).ApplyRequestRouting(nil)
+}
+
+// TestOAuthKeyConfigBrowserLoginGrant pins the browser_login grant's own requirements: a refresh
+// token and the refresh endpoint, with none of the client_credentials or jwt_bearer fields.
+func TestOAuthKeyConfigBrowserLoginGrant(t *testing.T) {
+	valid := &OAuthKeyConfig{
+		GrantType:    OAuthGrantBrowserLogin,
+		TokenURL:     *NewSecretVar("https://copilot.tencent.com/v2/plugin/auth/token/refresh"),
+		AccessToken:  NewSecretVar("access-abc"),
+		RefreshToken: NewSecretVar("refresh-xyz"),
+		ExpiresAt:    "2026-10-22T12:00:00Z",
+	}
+	require.NoError(t, valid.Validate())
+
+	noTokenURL := *valid
+	noTokenURL.TokenURL = SecretVar{}
+	require.ErrorContains(t, noTokenURL.Validate(), "token_url is required")
+
+	// browser_login must not demand client_credentials or jwt_bearer fields.
+	require.Nil(t, valid.ClientID)
+	require.Nil(t, valid.PrivateKey)
+
+	plainHTTP := *valid
+	plainHTTP.TokenURL = *NewSecretVar("http://copilot.tencent.com/v2/plugin/auth/token/refresh")
+	require.ErrorContains(t, plainHTTP.Validate(), "must be https")
+
+	noRefreshToken := *valid
+	noRefreshToken.RefreshToken = nil
+	require.ErrorContains(t, noRefreshToken.Validate(), "refresh_token is required")
+
+	badExpiry := *valid
+	badExpiry.ExpiresAt = "2026-10-22 12:00:00"
+	require.ErrorContains(t, badExpiry.Validate(), "must be RFC3339")
+
+	// An empty expiry is allowed: it means "unknown, refresh on use".
+	noExpiry := *valid
+	noExpiry.ExpiresAt = ""
+	require.NoError(t, noExpiry.Validate())
+}
+
+// TestOAuthKeyConfigRedactedMasksBrowserLoginTokens pins that both browser_login tokens are masked
+// on read and that redaction copies rather than mutating the live config.
+func TestOAuthKeyConfigRedactedMasksBrowserLoginTokens(t *testing.T) {
+	cfg := &OAuthKeyConfig{
+		GrantType:    OAuthGrantBrowserLogin,
+		TokenURL:     *NewSecretVar("https://copilot.tencent.com/v2/plugin/auth/token/refresh"),
+		AccessToken:  NewSecretVar("access-abc"),
+		RefreshToken: NewSecretVar("refresh-xyz"),
+	}
+	got := cfg.Redacted()
+	require.NotEqual(t, "access-abc", got.AccessToken.GetValue())
+	require.NotEqual(t, "refresh-xyz", got.RefreshToken.GetValue())
+	require.True(t, got.AccessToken.IsMaskedPlaceholder())
+	require.True(t, got.RefreshToken.IsMaskedPlaceholder())
+	// The original must be untouched: Redacted returns a copy.
+	require.Equal(t, "access-abc", cfg.AccessToken.GetValue())
 }

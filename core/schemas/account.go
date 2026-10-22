@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/bytedance/sonic"
 )
@@ -1045,6 +1046,10 @@ const (
 	// OAuthGrantJWTBearer is the JWT bearer assertion grant (RFC 7523): Bifrost signs an
 	// assertion with the configured private key and exchanges it for an access token.
 	OAuthGrantJWTBearer OAuthGrantType = "jwt_bearer"
+	// OAuthGrantBrowserLogin is an interactive browser login: the operator signs in once in the
+	// dashboard, and the durable credential is a refresh token that mints short-lived access
+	// tokens. The token endpoint is a refresh endpoint, so client_id/client_secret are not used.
+	OAuthGrantBrowserLogin OAuthGrantType = "browser_login"
 )
 
 // OAuthAuthStyle selects where the client_credentials grant sends the client ID and secret.
@@ -1066,7 +1071,7 @@ const (
 // Leave Key.Value empty to mint from this config; a non-empty Value always wins and is sent
 // verbatim as the bearer token.
 type OAuthKeyConfig struct {
-	GrantType                OAuthGrantType    `json:"grant_type"`                           // client_credentials or jwt_bearer (required)
+	GrantType                OAuthGrantType    `json:"grant_type"`                           // client_credentials, jwt_bearer or browser_login (required)
 	TokenURL                 SecretVar         `json:"token_url"`                            // Token endpoint, absolute https URL (required, supports env. prefix)
 	ClientID                 *SecretVar        `json:"client_id,omitempty"`                  // client_credentials: client ID (required for that grant)
 	ClientSecret             *SecretVar        `json:"client_secret,omitempty"`              // client_credentials: client secret (required for that grant)
@@ -1078,6 +1083,9 @@ type OAuthKeyConfig struct {
 	KeyID                    string            `json:"key_id,omitempty"`                     // jwt_bearer: kid header
 	SigningAlgorithm         string            `json:"signing_algorithm,omitempty"`          // jwt_bearer: RS256 (default), RS384, RS512, PS256, PS384, PS512, ES256, ES384, ES512
 	AuthStyle                OAuthAuthStyle    `json:"auth_style,omitempty"`                 // client_credentials: header (default) or body
+	AccessToken              *SecretVar        `json:"access_token,omitempty"`               // browser_login: short-lived bearer, refreshed before use
+	RefreshToken             *SecretVar        `json:"refresh_token,omitempty"`              // browser_login: durable credential that mints access tokens
+	ExpiresAt                string            `json:"expires_at,omitempty"`                 // browser_login: RFC3339 expiry; empty means refresh on use
 	ExtraParams              map[string]string `json:"extra_params,omitempty"`               // Extra form parameters sent on the token request
 	AssertionLifetimeSeconds int               `json:"assertion_lifetime_seconds,omitempty"` // jwt_bearer: assertion exp - iat (default 300)
 }
@@ -1096,6 +1104,8 @@ func (c *OAuthKeyConfig) Redacted() *OAuthKeyConfig {
 	cfg.ClientID = cfg.ClientID.Redacted()
 	cfg.ClientSecret = cfg.ClientSecret.Redacted()
 	cfg.PrivateKey = cfg.PrivateKey.Redacted()
+	cfg.AccessToken = cfg.AccessToken.Redacted()
+	cfg.RefreshToken = cfg.RefreshToken.Redacted()
 	// extra_params values are sent to the token endpoint as the literal strings they are, so
 	// they are masked as strings: parsing them as secret references would resolve an
 	// "env."-looking value (a vault lookup on a GET) and mask an unset one to "", which an
@@ -1176,10 +1186,19 @@ func (c *OAuthKeyConfig) Validate() error {
 		if c.AssertionLifetimeSeconds < 0 || c.AssertionLifetimeSeconds > 3600 {
 			return fmt.Errorf("oauth_key_config.assertion_lifetime_seconds must be between 0 (default) and 3600")
 		}
+	case OAuthGrantBrowserLogin:
+		if !has(c.RefreshToken) {
+			return fmt.Errorf("oauth_key_config.refresh_token is required for the browser_login grant")
+		}
+		if c.ExpiresAt != "" {
+			if _, err := time.Parse(time.RFC3339, c.ExpiresAt); err != nil {
+				return fmt.Errorf("oauth_key_config.expires_at must be RFC3339")
+			}
+		}
 	case "":
 		return fmt.Errorf("oauth_key_config.grant_type is required")
 	default:
-		return fmt.Errorf("oauth_key_config.grant_type must be client_credentials or jwt_bearer")
+		return fmt.Errorf("oauth_key_config.grant_type must be client_credentials, jwt_bearer or browser_login")
 	}
 	return nil
 }

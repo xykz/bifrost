@@ -77,7 +77,7 @@ func providerRequiresKey(customConfig *schemas.CustomProviderConfig) bool {
 // GitHub Copilot may authenticate with a GitHub App bundle in github_copilot_key_config
 // instead of a Copilot API token in value; validateKey checks that one of the two is present.
 func CanProviderKeyValueBeEmpty(providerKey schemas.ModelProvider) bool {
-	return providerKey == schemas.Vertex || providerKey == schemas.Bedrock || providerKey == schemas.BedrockMantle || providerKey == schemas.VLLM || providerKey == schemas.Azure || providerKey == schemas.Ollama || providerKey == schemas.SGL || providerKey == schemas.Databricks || providerKey == schemas.GithubCopilot
+	return providerKey == schemas.Vertex || providerKey == schemas.Bedrock || providerKey == schemas.BedrockMantle || providerKey == schemas.VLLM || providerKey == schemas.Azure || providerKey == schemas.Ollama || providerKey == schemas.SGL || providerKey == schemas.Databricks || providerKey == schemas.GithubCopilot || providerKey == schemas.CodeBuddyCN
 }
 
 // isKeySkippingAllowed gates SkipKeySelection on the provider this attempt resolved to. The flag
@@ -247,7 +247,7 @@ func validateKey(providerKey schemas.ModelProvider, key *schemas.Key) error {
 // ProviderSupportsOAuthKeyConfig reports whether a provider (the base provider for a custom
 // one) resolves oauth_key_config into a bearer token.
 func ProviderSupportsOAuthKeyConfig(providerKey schemas.ModelProvider) bool {
-	return providerKey == schemas.OpenAI
+	return providerKey == schemas.OpenAI || providerKey == schemas.CodeBuddyCN
 }
 
 // keyValueMayBeEmpty reports whether a key with no value is still usable: either the provider
