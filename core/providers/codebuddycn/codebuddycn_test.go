@@ -3,14 +3,18 @@ package codebuddycn
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
+	"github.com/maximhq/bifrost/core/providers/openai"
 	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 	"github.com/valyala/fasthttp"
 )
 
@@ -861,6 +865,95 @@ func TestEnvelopeErrorIgnoresZeroCode(t *testing.T) {
 	require.Nil(t, envelopeError([]byte(`{"code":0,"data":{"accessToken":"a"}}`)))
 }
 
+// BenchmarkEnvelopeError measures the in-band check the provider added, over realistic completion
+// body sizes. It is the half of the happy-path cost this provider owns; the other half is the
+// shared helper's full-body gjson.ValidBytes, which BenchmarkInBandValidationPath isolates below.
+func BenchmarkEnvelopeError(b *testing.B) {
+	for _, size := range []int{2 << 10, 16 << 10} {
+		body := syntheticCompletionBody(size)
+		b.Run(fmt.Sprintf("%dKB", size>>10), func(b *testing.B) {
+			b.SetBytes(int64(len(body)))
+			b.ReportAllocs()
+			for b.Loop() {
+				_ = envelopeError(body)
+			}
+		})
+	}
+}
+
+// BenchmarkInBandValidationPath records what supplying a customResponseHandler costs the shared
+// helper on top of the provider's own pre-filter: with a handler the helper validates the entire
+// body before scanning it, so the happy path pays a full-body scan it did not pay before.
+//
+// It is deliberately not a micro-benchmark of a single function: the "before" arm is the cheap
+// top-level lookup the shared helper performed on its no-handler path, and the "after" arm is the
+// whole ErrorInSuccessfulChatBody call it now makes. The difference is the added cost this
+// provider introduced.
+func BenchmarkInBandValidationPath(b *testing.B) {
+	for _, size := range []int{2 << 10, 16 << 10} {
+		body := syntheticCompletionBody(size)
+		name := fmt.Sprintf("%dKB", size>>10)
+
+		b.Run("before/top-level-error-lookup/"+name, func(b *testing.B) {
+			b.SetBytes(int64(len(body)))
+			b.ReportAllocs()
+			for b.Loop() {
+				benchGJSONSink = gjson.GetBytes(body, "error")
+			}
+		})
+		b.Run("after/ErrorInSuccessfulChatBody/"+name, func(b *testing.B) {
+			b.SetBytes(int64(len(body)))
+			b.ReportAllocs()
+			for b.Loop() {
+				benchErrorSink = openai.ErrorInSuccessfulChatBody(body)
+			}
+		})
+	}
+}
+
+// syntheticCompletionBody builds a valid OpenAI chat completion body of roughly n bytes: real
+// envelope fields, with the content padded to reach the requested size.
+func syntheticCompletionBody(n int) []byte {
+	const head = `{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"hunyuan-chat","choices":[{"index":0,"message":{"role":"assistant","content":"`
+	const tail = `"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`
+	padding := max(n-len(head)-len(tail), 0)
+	return []byte(head + strings.Repeat("a", padding) + tail)
+}
+
+// Documented streaming semantics change from supplying a customResponseHandler: a frame that fails
+// to decode now terminates the stream with an error chunk. The no-handler path logged the parse
+// failure and continued, which let a mid-stream HTML/APISIX body vanish as an empty completion.
+func TestChatCompletionStreamSurfacesUndecodableFrames(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n"))
+		// A truncated frame: valid JSON prefix, no closing brace, no gateway envelope.
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-2\",\"choices\":[{\"index\":\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	p := newTestProvider(t, server.URL)
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	key := schemas.Key{Value: *schemas.NewSecretVar("sk-pasted")}
+
+	postHookRunner := func(_ *schemas.BifrostContext, result *schemas.BifrostResponse, bErr *schemas.BifrostError) (*schemas.BifrostResponse, *schemas.BifrostError) {
+		return result, bErr
+	}
+	stream, bErr := p.ChatCompletionStream(ctx, postHookRunner, nil, key, chatRequest())
+	require.Nil(t, bErr)
+
+	var streamErr *schemas.BifrostError
+	for chunk := range stream {
+		if chunk != nil && chunk.BifrostError != nil {
+			streamErr = chunk.BifrostError
+		}
+	}
+	require.NotNil(t, streamErr, "an undecodable frame must terminate the stream with an error, not be skipped")
+	require.NotNil(t, streamErr.Error)
+	require.NotEmpty(t, streamErr.Error.Message)
+}
+
 // fasthttpResponse builds the response shape the error parser reads.
 func fasthttpResponse(status int, body string) *fasthttp.Response {
 	resp := fasthttp.AcquireResponse()
@@ -870,9 +963,18 @@ func fasthttpResponse(status int, body string) *fasthttp.Response {
 }
 
 // benchHeaderSink keeps the benchmarked maps reachable. Without it the compiler sees the result
-// is unused and eliminates the call entirely, which is how BenchmarkAuthHeaderForStaticKey came to
-// report 0 allocs for a function that does allocate.
+// is unused and eliminates the call entirely, which is how BenchmarkAuthHeaderForStaticKey and
+// BenchmarkEditorHeaders both came to report 0 allocs for functions that do allocate.
 var benchHeaderSink map[string]string
+
+// benchSecretVarSink does the same for editorHeaders, whose return type is not a map[string]string.
+var benchSecretVarSink map[string]schemas.SecretVar
+
+// benchGJSONSink and benchErrorSink do it for the validation-path benchmark.
+var (
+	benchGJSONSink gjson.Result
+	benchErrorSink *schemas.BifrostError
+)
 
 func BenchmarkAuthHeaderForStaticKey(b *testing.B) {
 	key := schemas.Key{Value: *schemas.NewSecretVar("sk-pasted")}
@@ -893,7 +995,7 @@ func BenchmarkAuthHeaderForOAuthKey(b *testing.B) {
 func BenchmarkEditorHeaders(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
-		_ = editorHeaders()
+		benchSecretVarSink = editorHeaders()
 	}
 }
 
