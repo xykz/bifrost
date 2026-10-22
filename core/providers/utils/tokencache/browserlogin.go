@@ -41,9 +41,13 @@ type browserLoginTokenSet struct {
 
 // BrowserLoginMinter returns a Minter that exchanges the config's refresh token for an access
 // token. The refresh token rides in the X-Refresh-Token header (the endpoint ignores the body),
-// and a successful exchange usually returns a rotated refresh token. Rotation is reported
+// and a successful exchange usually returns a rotated refresh token. Rotation is delivered
 // through onRotate, which may be nil: tokencache.Entry has no metadata channel, and adding one
-// would change a struct every provider's cache shares.
+// would change a struct every provider's cache shares. A nil callback means the rotated refresh
+// token is discarded, so a caller routing through MinterForConfig or ResolveBearerFrom — both of
+// which pass nil — cannot keep a rotation, and a key whose upstream invalidates the old refresh
+// token on rotation will fail at the next mint. Only a caller that owns persistence should call
+// this directly with a callback.
 //
 // cfg must have passed validateConfig; MinterForConfig is the only caller and validates first.
 // The endpoint and refresh token are read once, when the minter is built on the cold path, so
@@ -52,8 +56,7 @@ type browserLoginTokenSet struct {
 // onRotate runs before the entry is returned, so a caller that persists the rotated refresh
 // token has stored it by the time the request that triggered the mint proceeds. It runs while
 // the cache holds the slot mutex, so it must not block: callers for the same credential wait
-// behind it. A nil callback is the normal case for a key whose refresh token is not rotated
-// back into storage.
+// behind it.
 func BrowserLoginMinter(cfg *schemas.OAuthKeyConfig, hc *http.Client, onRotate func(accessToken, refreshToken string, expiresAt time.Time)) Minter[string] {
 	refreshURL := strings.TrimSpace(cfg.TokenURL.GetValue())
 	refreshToken := secret(cfg.RefreshToken)
@@ -64,8 +67,8 @@ func BrowserLoginMinter(cfg *schemas.OAuthKeyConfig, hc *http.Client, onRotate f
 		if bErr != nil {
 			return nil, bErr
 		}
-		// RefreshAt sits a minute before expiry so the cache mints during the refresh margin,
-		// not after the upstream has already started rejecting the token.
+		// entryFor owns the refresh-margin arithmetic, including the clamp that keeps a token
+		// whose lifetime is shorter than the margin fresh instead of stale on arrival.
 		expiresAt := time.Now().Add(expiresIn)
 		if rotated == "" {
 			rotated = refreshToken
@@ -73,11 +76,7 @@ func BrowserLoginMinter(cfg *schemas.OAuthKeyConfig, hc *http.Client, onRotate f
 		if onRotate != nil {
 			onRotate(accessToken, rotated, expiresAt)
 		}
-		return &Entry[string]{
-			Value:     accessToken,
-			ExpiresAt: expiresAt,
-			RefreshAt: expiresAt.Add(-DefaultRefreshMargin),
-		}, nil
+		return entryFor(accessToken, expiresAt, DefaultRefreshMargin), nil
 	}
 }
 

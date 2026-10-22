@@ -450,6 +450,8 @@ func TestBrowserLoginMinterRotateAndTiming(t *testing.T) {
 		}
 		_, bErr := BrowserLoginMinter(cfg, srv.Client(), nil)(context.Background(), nil)
 		require.NotNil(t, bErr)
+		require.NotNil(t, bErr.StatusCode)
+		assert.Equal(t, http.StatusBadGateway, *bErr.StatusCode)
 		assert.Nil(t, bErr.AllowFallbacks, "an unknown refusal must leave fallbacks open")
 		assert.Contains(t, bErr.Error.Message, "upstream busy")
 	})
@@ -464,6 +466,79 @@ func TestBrowserLoginMinterRotateAndTiming(t *testing.T) {
 		_, bErr := BrowserLoginMinter(cfg, srv.Client(), nil)(context.Background(), nil)
 		require.NotNil(t, bErr)
 		assert.Contains(t, bErr.Error.Message, "no access_token")
+	})
+
+	t.Run("an expiry inside the refresh margin still yields a future RefreshAt", func(t *testing.T) {
+		// A 30s lifetime is shorter than the 60s refresh margin: ExpiresAt-60s would land in
+		// the past, making the entry stale on arrival. Every request would then serialise on
+		// the slot mutex and hit the network — a refresh storm on the inference path.
+		var calls atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"code":0,"data":{"accessToken":"access-short","refreshToken":"refresh-2","expiresIn":30}}`))
+		}))
+		t.Cleanup(srv.Close)
+		cfg := schemas.OAuthKeyConfig{
+			GrantType:    schemas.OAuthGrantBrowserLogin,
+			TokenURL:     *schemas.NewSecretVar(srv.URL),
+			RefreshToken: schemas.NewSecretVar("refresh-1"),
+		}
+		cache := New[string](Options{})
+		headers, bErr := ResolveBearerFrom(context.Background(), cache, cfg, srv.Client())
+		require.Nil(t, bErr)
+		require.Equal(t, "Bearer access-short", headers["Authorization"])
+
+		// A second call must be served from the cache, not a second refresh.
+		_, bErr = ResolveBearerFrom(context.Background(), cache, cfg, srv.Client())
+		require.Nil(t, bErr)
+		require.EqualValues(t, 1, calls.Load(), "a short-lived token must not be re-minted on every call")
+
+		// The entry itself must be fresh now and expire when the endpoint said it would.
+		e, bErr := BrowserLoginMinter(&cfg, srv.Client(), nil)(context.Background(), nil)
+		require.Nil(t, bErr)
+		require.True(t, e.RefreshAt.After(time.Now()), "RefreshAt must be in the future for a short expiry")
+		assert.WithinDuration(t, time.Now().Add(30*time.Second), e.ExpiresAt, 5*time.Second)
+		assert.True(t, e.RefreshAt.Before(e.ExpiresAt), "RefreshAt must precede expiry")
+	})
+
+	t.Run("a 200 with the dead-token code is permanent on its own", func(t *testing.T) {
+		// The code alone, with no HTTP 401, must be enough: the endpoint reports its real
+		// status in the body envelope.
+		srv := serve(t, `{"code":12153,"msg":"refresh token expired"}`)
+		cfg := &schemas.OAuthKeyConfig{
+			GrantType:    schemas.OAuthGrantBrowserLogin,
+			TokenURL:     *schemas.NewSecretVar(srv.URL),
+			RefreshToken: schemas.NewSecretVar("dead"),
+		}
+		_, bErr := BrowserLoginMinter(cfg, srv.Client(), nil)(context.Background(), nil)
+		require.NotNil(t, bErr)
+		require.NotNil(t, bErr.StatusCode)
+		assert.Equal(t, http.StatusUnauthorized, *bErr.StatusCode)
+		require.NotNil(t, bErr.AllowFallbacks)
+		assert.False(t, *bErr.AllowFallbacks, "a dead credential must not fall back")
+		assert.Contains(t, bErr.Error.Message, "re-authenticate")
+	})
+
+	t.Run("a bare HTTP 401 without the code is permanent too", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{}`))
+		}))
+		t.Cleanup(srv.Close)
+		cfg := &schemas.OAuthKeyConfig{
+			GrantType:    schemas.OAuthGrantBrowserLogin,
+			TokenURL:     *schemas.NewSecretVar(srv.URL),
+			RefreshToken: schemas.NewSecretVar("dead"),
+		}
+		_, bErr := BrowserLoginMinter(cfg, srv.Client(), nil)(context.Background(), nil)
+		require.NotNil(t, bErr)
+		require.NotNil(t, bErr.StatusCode)
+		assert.Equal(t, http.StatusUnauthorized, *bErr.StatusCode)
+		require.NotNil(t, bErr.AllowFallbacks)
+		assert.False(t, *bErr.AllowFallbacks)
+		assert.Contains(t, bErr.Error.Message, "re-authenticate")
 	})
 
 	t.Run("a rejection never echoes the refresh token", func(t *testing.T) {
