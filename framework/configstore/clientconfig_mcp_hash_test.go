@@ -138,6 +138,68 @@ func TestGenerateKeyHash_OAuthSecretsHashByReference(t *testing.T) {
 	require.NotEqual(t, viaRef, viaLiteral, "switching between a reference and a literal is an edit")
 }
 
+// TestOAuthKeyConfigHashIgnoresRotatingTokenState pins that the key hash tracks declared
+// configuration, not the runtime state of a browser_login credential. A refresh replaces the
+// access token and its expiry, and rotates the refresh token; none of that is a config.json
+// edit, so the hash must not move or reconciliation overwrites the freshly minted credential
+// with the stale one from the file on every restart. A genuinely different declared source
+// still has to be detected, so the refresh token is hashed by source, not dropped.
+func TestOAuthKeyConfigHashIgnoresRotatingTokenState(t *testing.T) {
+	base := schemas.OAuthKeyConfig{
+		GrantType:    schemas.OAuthGrantBrowserLogin,
+		TokenURL:     *schemas.NewSecretVar("https://copilot.tencent.com/v2/plugin/auth/token/refresh"),
+		AccessToken:  schemas.NewSecretVar("access-1"),
+		RefreshToken: schemas.NewSecretVar("refresh-1"),
+		ExpiresAt:    "2026-10-22T12:00:00Z",
+	}
+	rotated := base
+	rotated.AccessToken = schemas.NewSecretVar("access-2")
+	rotated.ExpiresAt = "2026-10-22T13:00:00Z"
+
+	keyA := schemas.Key{ID: "k1", Name: "cb", Value: schemas.SecretVar{}, OAuthKeyConfig: &base}
+	keyB := schemas.Key{ID: "k1", Name: "cb", Value: schemas.SecretVar{}, OAuthKeyConfig: &rotated}
+
+	h1, err := GenerateKeyHash(keyA)
+	require.NoError(t, err)
+	h2, err := GenerateKeyHash(keyB)
+	require.NoError(t, err)
+	require.Equal(t, h1, h2, "a refreshed token must not look like a config change")
+
+	// But a genuinely different declared credential must change the hash.
+	other := base
+	other.RefreshToken = schemas.NewSecretVar("refresh-other-source")
+	keyC := schemas.Key{ID: "k1", Name: "cb", Value: schemas.SecretVar{}, OAuthKeyConfig: &other}
+	h3, err := GenerateKeyHash(keyC)
+	require.NoError(t, err)
+	require.NotEqual(t, h1, h3)
+}
+
+// TestGenerateKeyHash_OAuthRefreshTokenHashesBySource pins the other half of the browser_login
+// rule: when the refresh token is declared as a reference, rotating the value behind it is not
+// a config.json edit, while switching between a reference and a literal is.
+func TestGenerateKeyHash_OAuthRefreshTokenHashesBySource(t *testing.T) {
+	build := func(refreshToken string) schemas.Key {
+		return schemas.Key{ID: "k1", Name: "cb", OAuthKeyConfig: &schemas.OAuthKeyConfig{
+			GrantType:    schemas.OAuthGrantBrowserLogin,
+			TokenURL:     *schemas.NewSecretVar("https://copilot.tencent.com/v2/plugin/auth/token/refresh"),
+			RefreshToken: schemas.NewSecretVar(refreshToken),
+		}}
+	}
+	t.Setenv("HASH_TEST_OAUTH_REFRESH", "refresh-v1")
+	before, err := GenerateKeyHash(build("env.HASH_TEST_OAUTH_REFRESH"))
+	require.NoError(t, err)
+	t.Setenv("HASH_TEST_OAUTH_REFRESH", "refresh-v2")
+	after, err := GenerateKeyHash(build("env.HASH_TEST_OAUTH_REFRESH"))
+	require.NoError(t, err)
+	require.Equal(t, before, after, "rotating a referenced refresh token must not look like a config change")
+
+	viaRef, err := GenerateKeyHash(build("env.HASH_TEST_OAUTH_REFRESH"))
+	require.NoError(t, err)
+	viaLiteral, err := GenerateKeyHash(build("refresh-v2"))
+	require.NoError(t, err)
+	require.NotEqual(t, viaRef, viaLiteral, "switching between a reference and a literal is an edit")
+}
+
 // TestGenerateKeyHash_AliasesIsOrderIndependent pins the same property for aliases, which is
 // also a map: a key whose only change is the encoder's walk order must not be treated as edited.
 func TestGenerateKeyHash_AliasesIsOrderIndependent(t *testing.T) {

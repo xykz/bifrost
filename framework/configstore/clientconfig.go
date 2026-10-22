@@ -1150,6 +1150,15 @@ func oauthKeyConfigHashView(cfg *schemas.OAuthKeyConfig) *schemas.OAuthKeyConfig
 	view.ClientID = source(cfg.ClientID)
 	view.ClientSecret = source(cfg.ClientSecret)
 	view.PrivateKey = source(cfg.PrivateKey)
+	// browser_login credentials rotate at runtime: every refresh replaces the access token and
+	// its expiry. Those are state, not declared configuration, so they are blanked here. The
+	// refresh token is reduced to its source marker so a config.json-managed key is not seen as
+	// changed (and overwritten from file) every time a refresh lands.
+	view.AccessToken = nil
+	view.ExpiresAt = ""
+	if cfg.RefreshToken != nil {
+		view.RefreshToken = source(cfg.RefreshToken)
+	}
 	return &view
 }
 
