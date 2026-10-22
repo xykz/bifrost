@@ -251,7 +251,7 @@ func (p *CodeBuddyCNProvider) ChatCompletion(ctx *schemas.BifrostContext, key sc
 		providerUtils.ShouldSendBackRawRequest(ctx, p.sendBackRawRequest),
 		providerUtils.ShouldSendBackRawResponse(ctx, p.sendBackRawResponse),
 		p.GetProviderKey(),
-		nil,
+		chatResponseHandler,
 		parseError,
 		nil,
 		p.logger,
@@ -280,7 +280,7 @@ func (p *CodeBuddyCNProvider) ChatCompletionStream(ctx *schemas.BifrostContext, 
 		p.GetProviderKey(),
 		postHookRunner,
 		nil,
-		nil,
+		chatResponseHandler,
 		parseError,
 		nil,
 		nil,
@@ -305,15 +305,23 @@ func (p *CodeBuddyCNProvider) TextCompletionStream(ctx *schemas.BifrostContext, 
 	return nil, providerUtils.NewUnsupportedOperationError(schemas.TextCompletionStreamRequest, p.GetProviderKey())
 }
 
-// Responses is not supported by the CodeBuddy CN provider: the gateway serves only the chat
-// completions surface, and the Responses API is not part of the verified wire contract.
+// Responses performs a responses request to the CodeBuddy API. The gateway serves only the chat
+// completions surface, so this is served through chat and folded back into the Responses shape,
+// exactly as the other OpenAI-compatible providers do it — and as
+// llmtests.RunSimpleChatTest, which requires both shapes to pass, expects.
 func (p *CodeBuddyCNProvider) Responses(ctx *schemas.BifrostContext, key schemas.Key, request *schemas.BifrostResponsesRequest) (*schemas.BifrostResponsesResponse, *schemas.BifrostError) {
-	return nil, providerUtils.NewUnsupportedOperationError(schemas.ResponsesRequest, p.GetProviderKey())
+	chatResponse, bErr := p.ChatCompletion(ctx, key, request.ToChatRequest())
+	if bErr != nil {
+		return nil, bErr
+	}
+	return chatResponse.ToBifrostResponsesResponse(), nil
 }
 
-// ResponsesStream is not supported by the CodeBuddy CN provider.
+// ResponsesStream performs a streaming responses request to the CodeBuddy API. It marks the
+// context so the shared streaming helper maps chat deltas into Responses events, then delegates.
 func (p *CodeBuddyCNProvider) ResponsesStream(ctx *schemas.BifrostContext, postHookRunner schemas.PostHookRunner, postHookSpanFinalizer func(context.Context), key schemas.Key, request *schemas.BifrostResponsesRequest) (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
-	return nil, providerUtils.NewUnsupportedOperationError(schemas.ResponsesStreamRequest, p.GetProviderKey())
+	ctx.SetValue(schemas.BifrostContextKeyIsResponsesToChatCompletionFallback, true)
+	return p.ChatCompletionStream(ctx, postHookRunner, postHookSpanFinalizer, key, request.ToChatRequest())
 }
 
 // CountTokens is not supported by the CodeBuddy CN provider.

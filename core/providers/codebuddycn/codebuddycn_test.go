@@ -117,14 +117,6 @@ func TestEveryUnsupportedOperationReportsItsRequestType(t *testing.T) {
 			_, bErr := p.TextCompletionStream(ctx, nil, nil, key, &schemas.BifrostTextCompletionRequest{})
 			return bErr
 		}},
-		{"Responses", schemas.ResponsesRequest, func() *schemas.BifrostError {
-			_, bErr := p.Responses(ctx, key, &schemas.BifrostResponsesRequest{})
-			return bErr
-		}},
-		{"ResponsesStream", schemas.ResponsesStreamRequest, func() *schemas.BifrostError {
-			_, bErr := p.ResponsesStream(ctx, nil, nil, key, &schemas.BifrostResponsesRequest{})
-			return bErr
-		}},
 		{"CountTokens", schemas.CountTokensRequest, func() *schemas.BifrostError {
 			_, bErr := p.CountTokens(ctx, key, &schemas.BifrostResponsesRequest{})
 			return bErr
@@ -445,6 +437,236 @@ func TestChatCompletionStreamDecoratesTheRequest(t *testing.T) {
 	require.Contains(t, gotAccept, "text/event-stream")
 }
 
+// CodeBuddy reports most inference failures as an HTTP 200 whose body carries the gateway's own
+// {"code":N,"msg":"..."} envelope. Nothing in the shared OpenAI path looks for a top-level code,
+// so without the provider's own response handler these reach the caller as a success with no
+// choices and no usage. Each case below is a real server answering 200.
+//
+// The bare {"message":"..."} shape is not covered here: the front end sends it with a non-200
+// status, so it reaches parseError. TestParseErrorClassifiesDeadCredentials pins that path.
+func TestChatCompletionDetectsInBandErrorEnvelopes(t *testing.T) {
+	tests := []struct {
+		name               string
+		body               string
+		wantStatus         int
+		wantCode           string
+		wantAllowFallbacks *bool
+		wantMessage        string
+	}{
+		{
+			name:        "retriable failure",
+			body:        `{"code":40001,"msg":"model not available"}`,
+			wantStatus:  http.StatusBadGateway,
+			wantCode:    "40001",
+			wantMessage: "model not available",
+		},
+		{
+			name:               "dead refresh token is permanent",
+			body:               `{"code":12153,"msg":"refresh token invalid"}`,
+			wantStatus:         http.StatusUnauthorized,
+			wantCode:           "12153",
+			wantAllowFallbacks: schemas.Ptr(false),
+			wantMessage:        "refresh token invalid",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+
+			p := newTestProvider(t, server.URL)
+			ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+			key := schemas.Key{Value: *schemas.NewSecretVar("sk-pasted")}
+
+			response, bErr := p.ChatCompletion(ctx, key, chatRequest())
+			require.Nil(t, response, "an in-band failure must not return a response")
+			require.NotNil(t, bErr, "a 200 carrying a code envelope is a failure, not a success")
+			require.NotNil(t, bErr.StatusCode)
+			require.Equal(t, tc.wantStatus, *bErr.StatusCode)
+			require.NotNil(t, bErr.Error)
+			require.Contains(t, bErr.Error.Message, tc.wantMessage)
+
+			if tc.wantCode == "" {
+				require.Nil(t, bErr.Error.Code)
+			} else {
+				require.NotNil(t, bErr.Error.Code)
+				require.Equal(t, tc.wantCode, *bErr.Error.Code)
+			}
+			if tc.wantAllowFallbacks == nil {
+				require.Nil(t, bErr.AllowFallbacks, "a retriable failure leaves fallbacks allowed")
+			} else {
+				require.NotNil(t, bErr.AllowFallbacks)
+				require.Equal(t, *tc.wantAllowFallbacks, *bErr.AllowFallbacks)
+			}
+		})
+	}
+}
+
+// The handler must not disturb the happy path: a normal completion body still decodes into a
+// response with its content intact.
+func TestChatCompletionSucceedsOnANormalBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"hunyuan-chat","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer server.Close()
+
+	p := newTestProvider(t, server.URL)
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	key := schemas.Key{Value: *schemas.NewSecretVar("sk-pasted")}
+
+	response, bErr := p.ChatCompletion(ctx, key, chatRequest())
+	require.Nil(t, bErr)
+	require.NotNil(t, response)
+	require.Len(t, response.Choices, 1)
+	require.NotNil(t, response.Choices[0].ChatNonStreamResponseChoice)
+	message := response.Choices[0].ChatNonStreamResponseChoice.Message
+	require.NotNil(t, message)
+	require.NotNil(t, message.Content)
+	require.NotNil(t, message.Content.ContentStr)
+	require.Equal(t, "hello", *message.Content.ContentStr)
+	require.NotNil(t, response.Usage)
+}
+
+// A code envelope inside an SSE frame must become an error chunk, not a payload-less chunk the
+// caller silently discards.
+func TestChatCompletionStreamSurfacesInBandErrorFrames(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"code\":12153,\"msg\":\"refresh token invalid\"}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	p := newTestProvider(t, server.URL)
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	key := schemas.Key{Value: *schemas.NewSecretVar("sk-pasted")}
+
+	postHookRunner := func(_ *schemas.BifrostContext, result *schemas.BifrostResponse, bErr *schemas.BifrostError) (*schemas.BifrostResponse, *schemas.BifrostError) {
+		return result, bErr
+	}
+	stream, bErr := p.ChatCompletionStream(ctx, postHookRunner, nil, key, chatRequest())
+	require.Nil(t, bErr)
+
+	var streamErr *schemas.BifrostError
+	chunks := 0
+	for chunk := range stream {
+		if chunk == nil {
+			continue
+		}
+		chunks++
+		if chunk.BifrostError != nil {
+			streamErr = chunk.BifrostError
+		}
+	}
+
+	require.NotNil(t, streamErr, "the code envelope must surface as an error chunk")
+	require.NotNil(t, streamErr.StatusCode)
+	require.Equal(t, http.StatusUnauthorized, *streamErr.StatusCode)
+	require.Contains(t, streamErr.Error.Message, "refresh token invalid")
+	require.Equal(t, 1, chunks, "only the error chunk should be emitted")
+}
+
+// The Responses API is not on CodeBuddy's wire, so it is served through chat exactly as the other
+// OpenAI-compatible providers serve it. llmtests.RunSimpleChatTest requires both shapes to work.
+func TestResponsesDelegatesThroughChat(t *testing.T) {
+	var mu sync.Mutex
+	var gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gotPath = r.URL.Path
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"hunyuan-chat","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer server.Close()
+
+	p := newTestProvider(t, server.URL)
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	key := schemas.Key{Value: *schemas.NewSecretVar("sk-pasted")}
+
+	response, bErr := p.Responses(ctx, key, responsesRequest())
+	require.Nil(t, bErr)
+	require.NotNil(t, response)
+	require.NotNil(t, response.ID)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, "/v2/chat/completions", gotPath, "Responses must be served by the chat surface")
+}
+
+func TestResponsesStreamDelegatesThroughChat(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"hunyuan-chat\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"hunyuan-chat\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	p := newTestProvider(t, server.URL)
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	key := schemas.Key{Value: *schemas.NewSecretVar("sk-pasted")}
+
+	postHookRunner := func(_ *schemas.BifrostContext, result *schemas.BifrostResponse, _ *schemas.BifrostError) (*schemas.BifrostResponse, *schemas.BifrostError) {
+		return result, nil
+	}
+	stream, bErr := p.ResponsesStream(ctx, postHookRunner, nil, key, responsesRequest())
+	require.Nil(t, bErr)
+
+	chunks := 0
+	for chunk := range stream {
+		if chunk != nil {
+			chunks++
+		}
+	}
+	require.Positive(t, chunks, "the delegated stream must emit at least one chunk")
+}
+
+// A whitespace-only pasted value is no credential, so it must not stop the OAuth mint — and the
+// minted token must then be the credential that travels.
+func TestWhitespaceOnlyValueStillMintsAndSendsTheBearer(t *testing.T) {
+	var mu sync.Mutex
+	var gotAuth, gotAPIKey string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.URL.Path == "/v2/plugin/auth/token/refresh" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"code":0,"data":{"accessToken":"access-1","refreshToken":"refresh-2","expiresIn":3600}}`))
+			return
+		}
+		gotAuth, gotAPIKey = r.Header.Get("Authorization"), r.Header.Get("X-API-Key")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"hunyuan-chat","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+
+	p := newTestProvider(t, server.URL)
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	key := schemas.Key{
+		Value: *schemas.NewSecretVar("   "),
+		OAuthKeyConfig: &schemas.OAuthKeyConfig{
+			GrantType:    schemas.OAuthGrantBrowserLogin,
+			TokenURL:     *schemas.NewSecretVar(server.URL + "/v2/plugin/auth/token/refresh"),
+			RefreshToken: schemas.NewSecretVar("refresh-1"),
+		},
+	}
+
+	_, bErr := p.ChatCompletion(ctx, key, chatRequest())
+	require.Nil(t, bErr)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, "Bearer access-1", gotAuth)
+	require.Empty(t, gotAPIKey, "a whitespace-only value must not become an X-API-Key")
+}
+
 // An oauth key mints an access token from the refresh endpoint and sends it as a bearer, never as
 // X-API-Key. The second call must reuse the cached token instead of refreshing again.
 func TestChatCompletionRefreshesOAuthKeyAndReusesTheToken(t *testing.T) {
@@ -616,6 +838,29 @@ func TestResolveKeyLeavesPastedValuesAlone(t *testing.T) {
 	require.Equal(t, "sk-pasted", resolved.Value.GetValue())
 }
 
+// The pre-filter must not swallow a bare {"message":"..."} body on the error path: that shape has
+// no code key at all, and the front end sends it with a real non-200 status.
+func TestParseErrorReadsABareMessageBody(t *testing.T) {
+	got := parseError(fasthttpResponse(http.StatusBadRequest, `{"message":"invalid_format"}`))
+	require.NotNil(t, got.Error)
+	require.NotNil(t, got.StatusCode)
+	require.Equal(t, http.StatusBadGateway, *got.StatusCode)
+	require.Contains(t, got.Error.Message, "invalid_format")
+}
+
+// A body that merely mentions the word "code" without carrying the field is still a payload, not
+// an envelope. The byte pre-filter can only save work; it must never change the answer.
+func TestEnvelopeErrorIgnoresCodeInsideContent(t *testing.T) {
+	body := []byte(`{"id":"c1","choices":[{"index":0,"message":{"role":"assistant","content":"here is the code: 42"}}]}`)
+	require.Nil(t, envelopeError(body))
+}
+
+// A sentinel body that decodes to code 0 is a payload too, so the success path must not treat it
+// as an error.
+func TestEnvelopeErrorIgnoresZeroCode(t *testing.T) {
+	require.Nil(t, envelopeError([]byte(`{"code":0,"data":{"accessToken":"a"}}`)))
+}
+
 // fasthttpResponse builds the response shape the error parser reads.
 func fasthttpResponse(status int, body string) *fasthttp.Response {
 	resp := fasthttp.AcquireResponse()
@@ -624,11 +869,24 @@ func fasthttpResponse(status int, body string) *fasthttp.Response {
 	return resp
 }
 
+// benchHeaderSink keeps the benchmarked maps reachable. Without it the compiler sees the result
+// is unused and eliminates the call entirely, which is how BenchmarkAuthHeaderForStaticKey came to
+// report 0 allocs for a function that does allocate.
+var benchHeaderSink map[string]string
+
 func BenchmarkAuthHeaderForStaticKey(b *testing.B) {
 	key := schemas.Key{Value: *schemas.NewSecretVar("sk-pasted")}
 	b.ReportAllocs()
 	for b.Loop() {
-		_ = authHeaderFor(key, "")
+		benchHeaderSink = authHeaderFor(key, "")
+	}
+}
+
+func BenchmarkAuthHeaderForOAuthKey(b *testing.B) {
+	key := schemas.Key{}
+	b.ReportAllocs()
+	for b.Loop() {
+		benchHeaderSink = authHeaderFor(key, "access-abc")
 	}
 }
 
@@ -682,6 +940,19 @@ func chatRequest() *schemas.BifrostChatRequest {
 		Input: []schemas.ChatMessage{{
 			Role:    schemas.ChatMessageRoleUser,
 			Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("hi")},
+		}},
+	}
+}
+
+// responsesRequest is the Responses-shaped equivalent of chatRequest, used to drive the
+// chat-delegation path.
+func responsesRequest() *schemas.BifrostResponsesRequest {
+	return &schemas.BifrostResponsesRequest{
+		Provider: schemas.CodeBuddyCN,
+		Model:    "hunyuan-chat",
+		Input: []schemas.ResponsesMessage{{
+			Role:    schemas.Ptr(schemas.ResponsesInputMessageRoleUser),
+			Content: &schemas.ResponsesMessageContent{ContentStr: schemas.Ptr("hi")},
 		}},
 	}
 }

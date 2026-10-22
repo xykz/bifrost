@@ -1,6 +1,8 @@
 package codebuddycn
 
 import (
+	"strings"
+
 	schemas "github.com/maximhq/bifrost/core/schemas"
 )
 
@@ -56,8 +58,12 @@ func editorHeaders() map[string]schemas.SecretVar {
 // key is the credential as configured, which is what distinguishes the two modes; accessToken
 // is what the OAuth path minted, and is ignored for a key that carries a pasted value. Both
 // empty yields no credential header at all, so a keyless custom provider still works.
+//
+// Whitespace-only is treated as empty here and in resolveKey: the two must agree, or a blank
+// value would suppress the mint and then send no credential at all. Trimming matches
+// bifrost.go's own key validation.
 func authHeaderFor(key schemas.Key, accessToken string) map[string]string {
-	if value := key.Value.GetValue(); value != "" {
+	if value := strings.TrimSpace(key.Value.GetValue()); value != "" {
 		return map[string]string{apiKeyHeader: value}
 	}
 	if accessToken != "" {
