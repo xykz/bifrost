@@ -257,6 +257,10 @@ func (h *ProviderHandler) RegisterRoutes(r *router.Router, middlewares ...schema
 	// newly served model (or re-check a failing key) without waiting.
 	r.POST("/api/providers/{provider}/refresh-models", lib.ChainMiddlewares(h.refreshProviderModels, middlewares...))
 	r.POST("/api/providers/{provider}/keys/{key_id}/refresh-models", lib.ChainMiddlewares(h.refreshProviderKeyModels, middlewares...))
+	// Interactive browser login for a codebuddy-cn key. The admin opens auth_url, and the UI
+	// polls the flow until it carries the token pair to fill into the key form.
+	r.POST("/api/providers/{provider}/codebuddy-cn/login", lib.ChainMiddlewares(h.startCodeBuddyLogin, middlewares...))
+	r.GET("/api/providers/{provider}/codebuddy-cn/login/{flow_id}", lib.ChainMiddlewares(h.pollCodeBuddyLogin, middlewares...))
 	r.GET("/api/keys", lib.ChainMiddlewares(h.listKeys, middlewares...))
 	r.GET("/api/models", lib.ChainMiddlewares(h.listModels, middlewares...))
 	r.GET("/api/models/details", lib.ChainMiddlewares(h.listModelDetails, middlewares...))

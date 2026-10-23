@@ -1,0 +1,435 @@
+package handlers
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/bytedance/sonic"
+	"github.com/google/uuid"
+	"github.com/maximhq/bifrost/core/network"
+	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/maximhq/bifrost/transports/v2/bifrost-http/lib"
+	"github.com/valyala/fasthttp"
+)
+
+const (
+	// codeBuddyLoginDefaultBaseURL is the CN gateway, used when a codebuddy-cn provider has no
+	// base_url of its own. The device-flow calls below hang off the host root, like every other
+	// CodeBuddy path.
+	codeBuddyLoginDefaultBaseURL = "https://copilot.tencent.com"
+	// codeBuddyLoginStatePath and codeBuddyLoginTokenPath are the CLI's own device-flow
+	// endpoints. platform=CLI is not optional: the start call is rejected without it.
+	codeBuddyLoginStatePath = "/v2/plugin/auth/state?platform=CLI"
+	codeBuddyLoginTokenPath = "/v2/plugin/auth/token"
+	// codeBuddyLoginPendingCode is the upstream's "the browser has not finished yet" answer.
+	codeBuddyLoginPendingCode = 11217
+	// codeBuddyLoginKeyPrefix namespaces a flow in the shared store. flow_id is the rest of the
+	// key and is the only handle a client ever sees; the upstream state stays in the value.
+	codeBuddyLoginKeyPrefix = "codebuddy:login:"
+	// codeBuddyLoginPendingTTL is how long an unfinished browser sign-in is kept. Fifteen minutes
+	// covers a human logging in, including a password plus an MFA prompt, and nothing longer is
+	// useful: an abandoned popup should not leave an upstream authorization sitting around.
+	codeBuddyLoginPendingTTL = 15 * time.Minute
+	// codeBuddyLoginSettledTTL replaces the pending TTL the moment a flow reaches a terminal
+	// state. A completed flow holds a live access/refresh pair, so handing it out for the full
+	// pending window would widen the exposure of credentials the UI already has; five minutes is
+	// several poll cycles of slack. A failed flow carries no secret, but it is kept for the same
+	// five minutes so a repeat poll reads the terminal answer instead of starting over.
+	codeBuddyLoginSettledTTL = 5 * time.Minute
+	// codeBuddyLoginRequestTimeout bounds a single upstream call. The UI polls every couple of
+	// seconds, so a hung upstream must surface as an error it can retry, not hold the request.
+	codeBuddyLoginRequestTimeout = 10 * time.Second
+	// codeBuddyLoginMaxResponseBytes caps an upstream body. Both wire shapes are a few hundred
+	// bytes; anything larger is not the device flow answering.
+	codeBuddyLoginMaxResponseBytes = 1 << 20
+	// codeBuddyLoginAdminRequired is the refusal for a deployment with dashboard auth disabled,
+	// where isAuthBypassed is true for every caller on the network.
+	codeBuddyLoginAdminRequired = "codebuddy login requires an authenticated admin session; enable dashboard authentication first"
+	// codeBuddyLoginWrongProvider refuses a login route scoped to a provider that is not one of
+	// the gateway's CodeBuddy implementations.
+	codeBuddyLoginWrongProvider = "codebuddy login is only available for the codebuddy-cn provider"
+	// codeBuddyLoginFlowNotFound is the answer for an unknown, foreign, expired or already-dropped
+	// flow. It deliberately does not distinguish between them.
+	codeBuddyLoginFlowNotFound = "codebuddy login flow not found"
+)
+
+const (
+	codeBuddyLoginPending   = "pending"   // The browser has not completed the sign-in yet.
+	codeBuddyLoginCompleted = "completed" // The upstream issued a token pair.
+	codeBuddyLoginFailed    = "failed"    // The upstream answered with something terminal.
+)
+
+// errCodeBuddyLoginWrongProvider marks a provider the login route does not serve, as opposed to
+// one that is simply missing from the config.
+var errCodeBuddyLoginWrongProvider = errors.New(codeBuddyLoginWrongProvider)
+
+// codeBuddyLoginFlow is a login in progress, as stored in the shared KV store.
+//
+// The upstream state never leaves the server: it is what finishes the flow, so a client holding
+// it could impersonate the browser that was opened. flow_id is the opaque handle handed out
+// instead, and it is the store key's suffix rather than a field here.
+type codeBuddyLoginFlow struct {
+	State         string                `json:"state"`                   // Upstream device-flow state, server-side only
+	Provider      schemas.ModelProvider `json:"provider"`                // Provider the flow was started for
+	FlowExpiresAt time.Time             `json:"flow_expires_at"`         // Deadline for the browser to finish
+	Status        string                `json:"status"`                  // pending, completed or failed
+	AccessToken   string                `json:"access_token,omitempty"`  // Completed only
+	RefreshToken  string                `json:"refresh_token,omitempty"` // Completed only
+	ExpiresAt     string                `json:"expires_at,omitempty"`    // Completed only, RFC3339
+	Error         string                `json:"error,omitempty"`         // Failed only
+}
+
+// codeBuddyLoginStartResponse is the start endpoint's wire shape. It carries the flow handle and
+// the URL to open, never the upstream state behind them.
+type codeBuddyLoginStartResponse struct {
+	FlowID    string `json:"flow_id"`    // Opaque handle to poll with
+	AuthURL   string `json:"auth_url"`   // Browser URL the admin opens
+	ExpiresAt string `json:"expires_at"` // When the flow stops being pollable, RFC3339
+}
+
+// codeBuddyLoginStatusResponse is the poll endpoint's wire shape, identical for every state.
+type codeBuddyLoginStatusResponse struct {
+	Status       string `json:"status"`                  // pending, completed or failed
+	AccessToken  string `json:"access_token,omitempty"`  // Completed only
+	RefreshToken string `json:"refresh_token,omitempty"` // Completed only
+	ExpiresAt    string `json:"expires_at,omitempty"`    // Completed only, RFC3339
+	Error        string `json:"error,omitempty"`         // Failed only
+}
+
+// codeBuddyDeviceStateResponse is the upstream's answer to the start call.
+type codeBuddyDeviceStateResponse struct {
+	State   string `json:"state"`   // State to poll with
+	AuthURL string `json:"authUrl"` // Browser URL for the admin
+}
+
+// codeBuddyDeviceTokenData is the token pair inside a successful poll answer.
+type codeBuddyDeviceTokenData struct {
+	AccessToken  string `json:"accessToken"`  // Bearer used for inference
+	RefreshToken string `json:"refreshToken"` // Durable credential the key keeps
+	ExpiresIn    int    `json:"expiresIn"`    // Access-token lifetime in seconds
+	TokenType    string `json:"tokenType"`    // Always Bearer today
+}
+
+// codeBuddyDeviceTokenResponse is the upstream's answer to a poll.
+type codeBuddyDeviceTokenResponse struct {
+	Code    int                       `json:"code"`    // 0 success, 11217 pending, anything else failed
+	Message string                    `json:"message"` // Upstream explanation, never forwarded
+	Data    *codeBuddyDeviceTokenData `json:"data"`    // Present only on success
+}
+
+// codeBuddyLoginFallbackClient serves a config built without an HTTPClientFactory, which is what
+// a hand-constructed lib.Config (tests, embedded use) looks like. The live factory is preferred
+// so the flow honours the deployment's proxy settings.
+var codeBuddyLoginFallbackClient = &http.Client{Timeout: codeBuddyLoginRequestTimeout}
+
+// startCodeBuddyLogin handles POST /api/providers/{provider}/codebuddy-cn/login.
+//
+// It opens a device flow at the provider's own base URL and hands back an opaque flow handle.
+// The request body is never read: the only dial target is the one in the provider config, so a
+// caller cannot turn this endpoint into a request forwarder.
+func (h *ProviderHandler) startCodeBuddyLogin(ctx *fasthttp.RequestCtx) {
+	if isAuthBypassed(ctx) {
+		SendError(ctx, fasthttp.StatusForbidden, codeBuddyLoginAdminRequired)
+		return
+	}
+	provider, err := getProviderFromCtx(ctx)
+	if err != nil {
+		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("invalid provider: %v", err))
+		return
+	}
+	kv, err := h.codeBuddyLoginStore()
+	if err != nil {
+		SendError(ctx, fasthttp.StatusInternalServerError, err.Error())
+		return
+	}
+	baseURL, err := h.codeBuddyLoginBaseURL(provider)
+	if err != nil {
+		sendCodeBuddyLoginTargetError(ctx, err)
+		return
+	}
+
+	upstreamURL := baseURL + codeBuddyLoginStatePath
+	body, err := h.codeBuddyLoginCall(ctx, http.MethodPost, upstreamURL)
+	if err != nil {
+		logger.Warn("codebuddy login start failed for provider %s: %v", provider, err)
+		SendError(ctx, fasthttp.StatusBadGateway, "codebuddy login could not reach the provider")
+		return
+	}
+	var state codeBuddyDeviceStateResponse
+	if err := sonic.Unmarshal(body, &state); err != nil || state.State == "" || state.AuthURL == "" {
+		SendError(ctx, fasthttp.StatusBadGateway, "codebuddy login received an unexpected answer from the provider")
+		return
+	}
+
+	flowID := uuid.NewString()
+	flow := &codeBuddyLoginFlow{
+		State:         state.State,
+		Provider:      provider,
+		FlowExpiresAt: time.Now().Add(codeBuddyLoginPendingTTL).UTC(),
+		Status:        codeBuddyLoginPending,
+	}
+	if err := kv.SetWithTTL(codeBuddyLoginKey(flowID), flow, codeBuddyLoginPendingTTL); err != nil {
+		logger.Warn("failed to store codebuddy login flow for provider %s: %v", provider, err)
+		SendError(ctx, fasthttp.StatusInternalServerError, "failed to start codebuddy login")
+		return
+	}
+
+	SendJSON(ctx, codeBuddyLoginStartResponse{
+		FlowID:    flowID,
+		AuthURL:   state.AuthURL,
+		ExpiresAt: flow.FlowExpiresAt.Format(time.RFC3339),
+	})
+}
+
+// pollCodeBuddyLogin handles GET /api/providers/{provider}/codebuddy-cn/login/{flow_id}.
+//
+// A flow is polled until it settles. Once completed or failed, the stored answer is returned
+// verbatim and the upstream is not contacted again: the UI polls every couple of seconds and a
+// settled flow must be free to re-read.
+func (h *ProviderHandler) pollCodeBuddyLogin(ctx *fasthttp.RequestCtx) {
+	if isAuthBypassed(ctx) {
+		SendError(ctx, fasthttp.StatusForbidden, codeBuddyLoginAdminRequired)
+		return
+	}
+	provider, err := getProviderFromCtx(ctx)
+	if err != nil {
+		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("invalid provider: %v", err))
+		return
+	}
+	flowID, _ := ctx.UserValue("flow_id").(string)
+	if flowID == "" {
+		SendError(ctx, fasthttp.StatusBadRequest, "missing flow id")
+		return
+	}
+	kv, err := h.codeBuddyLoginStore()
+	if err != nil {
+		SendError(ctx, fasthttp.StatusInternalServerError, err.Error())
+		return
+	}
+
+	flow, err := loadCodeBuddyLoginFlow(kv, flowID)
+	if err != nil || flow.Provider != provider {
+		// A flow belonging to another provider is indistinguishable from a missing one: the
+		// provider segment of the path is not an authorization boundary a caller may probe.
+		SendError(ctx, fasthttp.StatusNotFound, codeBuddyLoginFlowNotFound)
+		return
+	}
+	if time.Now().After(flow.FlowExpiresAt) {
+		// The browser waited too long. Drop the entry rather than leave something an eventual
+		// poll could pick up again; the flow_id is dead from here on.
+		if _, deleteErr := kv.Delete(codeBuddyLoginKey(flowID)); deleteErr != nil {
+			logger.Warn("failed to drop expired codebuddy login flow: %v", deleteErr)
+		}
+		SendError(ctx, fasthttp.StatusNotFound, codeBuddyLoginFlowNotFound)
+		return
+	}
+	if flow.Status == codeBuddyLoginCompleted || flow.Status == codeBuddyLoginFailed {
+		SendJSON(ctx, codeBuddyLoginStatusOf(flow))
+		return
+	}
+
+	baseURL, err := h.codeBuddyLoginBaseURL(provider)
+	if err != nil {
+		sendCodeBuddyLoginTargetError(ctx, err)
+		return
+	}
+	upstreamURL := baseURL + codeBuddyLoginTokenPath + "?" + url.Values{"state": {flow.State}}.Encode()
+	body, err := h.codeBuddyLoginCall(ctx, http.MethodGet, upstreamURL)
+	if err != nil {
+		// A transport failure says nothing about the flow: the browser may still be signing in.
+		// Report it as retryable and leave the flow pending, so a blip does not force a re-login.
+		logger.Warn("codebuddy login poll failed for provider %s: %v", provider, err)
+		SendError(ctx, fasthttp.StatusBadGateway, "codebuddy login could not reach the provider")
+		return
+	}
+	var polled codeBuddyDeviceTokenResponse
+	if err := sonic.Unmarshal(body, &polled); err != nil {
+		settleCodeBuddyLogin(ctx, kv, flowID, flow, codeBuddyLoginFailed, "codebuddy login received an unexpected answer from the provider")
+		return
+	}
+
+	switch polled.Code {
+	case codeBuddyLoginPendingCode:
+		SendJSON(ctx, codeBuddyLoginStatusResponse{Status: codeBuddyLoginPending})
+	case 0:
+		if polled.Data == nil || polled.Data.AccessToken == "" || polled.Data.RefreshToken == "" {
+			settleCodeBuddyLogin(ctx, kv, flowID, flow, codeBuddyLoginFailed, "codebuddy login succeeded without a token pair")
+			return
+		}
+		settled := *flow
+		settled.Status = codeBuddyLoginCompleted
+		settled.AccessToken = polled.Data.AccessToken
+		settled.RefreshToken = polled.Data.RefreshToken
+		settled.ExpiresAt = ""
+		if polled.Data.ExpiresIn > 0 {
+			settled.ExpiresAt = time.Now().Add(time.Duration(polled.Data.ExpiresIn) * time.Second).UTC().Format(time.RFC3339)
+		}
+		// The browser deadline is spent; what bounds this entry now is the settled TTL. Moving the
+		// deadline with it keeps the stored lifetime and the expiry check telling the same story,
+		// so a sign-in that completes at minute 14 is still readable for its five minutes.
+		settled.FlowExpiresAt = time.Now().Add(codeBuddyLoginSettledTTL).UTC()
+		if err := kv.SetWithTTL(codeBuddyLoginKey(flowID), &settled, codeBuddyLoginSettledTTL); err != nil {
+			logger.Warn("failed to settle codebuddy login flow: %v", err)
+		}
+		SendJSON(ctx, codeBuddyLoginStatusOf(&settled))
+	default:
+		// The upstream said no in its own words. Its message is not forwarded: it is upstream
+		// text, and the state it was asked about must not travel back to a client in any form.
+		settleCodeBuddyLogin(ctx, kv, flowID, flow, codeBuddyLoginFailed,
+			fmt.Sprintf("codebuddy login was refused by the provider (code %d)", polled.Code))
+	}
+}
+
+// settleCodeBuddyLogin writes a terminal answer back so every later poll reads it without an
+// upstream call, and returns it. The write uses the settled TTL, not the pending one.
+func settleCodeBuddyLogin(ctx *fasthttp.RequestCtx, kv schemas.KVStore, flowID string, flow *codeBuddyLoginFlow, status, message string) {
+	settled := *flow
+	settled.Status = status
+	settled.Error = message
+	settled.AccessToken = ""
+	settled.RefreshToken = ""
+	settled.ExpiresAt = ""
+	settled.FlowExpiresAt = time.Now().Add(codeBuddyLoginSettledTTL).UTC()
+	if err := kv.SetWithTTL(codeBuddyLoginKey(flowID), &settled, codeBuddyLoginSettledTTL); err != nil {
+		logger.Warn("failed to settle codebuddy login flow: %v", err)
+	}
+	SendJSON(ctx, codeBuddyLoginStatusOf(&settled))
+}
+
+// codeBuddyLoginStatusOf projects a stored flow onto the poll response. Fields the flow does not
+// carry are omitted rather than serialized empty.
+func codeBuddyLoginStatusOf(flow *codeBuddyLoginFlow) codeBuddyLoginStatusResponse {
+	return codeBuddyLoginStatusResponse{
+		Status:       flow.Status,
+		AccessToken:  flow.AccessToken,
+		RefreshToken: flow.RefreshToken,
+		ExpiresAt:    flow.ExpiresAt,
+		Error:        flow.Error,
+	}
+}
+
+// codeBuddyLoginKey is the store key for a flow handle.
+func codeBuddyLoginKey(flowID string) string {
+	return codeBuddyLoginKeyPrefix + flowID
+}
+
+// loadCodeBuddyLoginFlow reads a flow and accepts both shapes a shared store can return it in:
+// the local pointer this node wrote, and the JSON bytes a peer decodes without a registered
+// decoder. Callers never mutate the result; they copy it before settling.
+func loadCodeBuddyLoginFlow(kv schemas.KVStore, flowID string) (*codeBuddyLoginFlow, error) {
+	value, err := kv.Get(codeBuddyLoginKey(flowID))
+	if err != nil {
+		return nil, err
+	}
+	switch stored := value.(type) {
+	case *codeBuddyLoginFlow:
+		if stored == nil {
+			return nil, errors.New("empty login flow")
+		}
+		return stored, nil
+	case codeBuddyLoginFlow:
+		return &stored, nil
+	case []byte:
+		var flow codeBuddyLoginFlow
+		if err := sonic.Unmarshal(stored, &flow); err != nil {
+			return nil, err
+		}
+		return &flow, nil
+	default:
+		return nil, errors.New("unexpected login flow type")
+	}
+}
+
+// codeBuddyLoginBaseURL resolves the only host a login may dial: the provider's configured
+// base_url, else the CN gateway. Nothing else — no request field, no header — contributes.
+//
+// A codebuddy-cn provider that has not been saved yet is allowed: the operator may be logging
+// in while filling out the add-provider form. Any other provider must exist and must resolve to
+// a codebuddy-cn implementation, whether directly or through its custom base provider.
+func (h *ProviderHandler) codeBuddyLoginBaseURL(provider schemas.ModelProvider) (string, error) {
+	if h.inMemoryStore == nil {
+		return "", errors.New("config is not available")
+	}
+	config, err := h.inMemoryStore.GetProviderConfigRaw(provider)
+	if err != nil {
+		if provider == schemas.CodeBuddyCN {
+			return codeBuddyLoginDefaultBaseURL, nil
+		}
+		return "", err
+	}
+	baseProvider := provider
+	if config.CustomProviderConfig != nil && config.CustomProviderConfig.BaseProviderType != "" {
+		baseProvider = config.CustomProviderConfig.BaseProviderType
+	}
+	if baseProvider != schemas.CodeBuddyCN {
+		return "", errCodeBuddyLoginWrongProvider
+	}
+	if config.NetworkConfig != nil {
+		if base := strings.TrimSpace(config.NetworkConfig.BaseURL); base != "" {
+			return strings.TrimRight(base, "/"), nil
+		}
+	}
+	return codeBuddyLoginDefaultBaseURL, nil
+}
+
+// codeBuddyLoginStore returns the shared store, so a flow survives across replicas.
+func (h *ProviderHandler) codeBuddyLoginStore() (schemas.KVStore, error) {
+	if h.inMemoryStore == nil || h.inMemoryStore.GetKVStore() == nil {
+		return nil, errors.New("codebuddy login is unavailable: kv store is not configured")
+	}
+	return h.inMemoryStore.GetKVStore(), nil
+}
+
+// codeBuddyLoginCall performs one upstream device-flow request and returns the body. The URL is
+// always assembled from codeBuddyLoginBaseURL, never from the inbound request.
+func (h *ProviderHandler) codeBuddyLoginCall(ctx *fasthttp.RequestCtx, method, upstreamURL string) ([]byte, error) {
+	reqCtx, cancel := RequestWorkContext(ctx, codeBuddyLoginRequestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, method, upstreamURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := h.codeBuddyLoginHTTPClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("upstream returned http %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, codeBuddyLoginMaxResponseBytes))
+	if err != nil {
+		return nil, err
+	}
+	return body, nil
+}
+
+// codeBuddyLoginHTTPClient prefers the config's live factory so the flow follows the
+// deployment's proxy settings, and falls back to a plain client for a hand-built config.
+func (h *ProviderHandler) codeBuddyLoginHTTPClient() *http.Client {
+	if h.inMemoryStore != nil && h.inMemoryStore.HTTPClientFactory != nil {
+		return h.inMemoryStore.HTTPClientFactory.GetHTTPClient(network.ClientPurposeAPI)
+	}
+	return codeBuddyLoginFallbackClient
+}
+
+// sendCodeBuddyLoginTargetError maps a base-URL resolution failure onto its status code.
+func sendCodeBuddyLoginTargetError(ctx *fasthttp.RequestCtx, err error) {
+	switch {
+	case errors.Is(err, errCodeBuddyLoginWrongProvider):
+		SendError(ctx, fasthttp.StatusBadRequest, codeBuddyLoginWrongProvider)
+	case errors.Is(err, lib.ErrNotFound):
+		SendError(ctx, fasthttp.StatusNotFound, "provider not found")
+	default:
+		SendError(ctx, fasthttp.StatusInternalServerError, err.Error())
+	}
+}
