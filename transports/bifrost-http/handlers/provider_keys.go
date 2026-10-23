@@ -327,7 +327,16 @@ func (h *ProviderHandler) updateProviderKey(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	if err := h.inMemoryStore.UpdateProviderKey(ctx, provider, keyID, mergedKey); err != nil {
+	// The read-time oauth block travels with the write so lib.Config can tell an echo of what this
+	// request was shown from a genuinely new token pair (a re-login). Without it, a save that merely
+	// renames the key would revert a rotation that landed between the read above and this write;
+	// with it, a new pair is written through instead of being discarded. See
+	// lib.Config.operatorOAuthKeyConfig for the rule.
+	var readTokens *schemas.OAuthKeyConfig
+	if oldRawKey.OAuthKeyConfig != nil {
+		readTokens = oldRawKey.OAuthKeyConfig
+	}
+	if err := h.inMemoryStore.UpdateProviderKeyWithReadTokens(ctx, provider, keyID, mergedKey, readTokens); err != nil {
 		logger.Warn("Failed to update key %s for provider %s: %v", keyID, provider, err)
 		if errors.Is(err, lib.ErrNotFound) {
 			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider key not found: %v", err))
@@ -805,10 +814,10 @@ func (h *ProviderHandler) mergeUpdatedKey(oldRawKey, updateKey schemas.Key) (sch
 		// runtime, so the value captured at read time is already stale by the time this merge
 		// runs — a refresh may have landed in between, and resolving the mask against the stale
 		// capture would write back the predecessor refresh token that upstream has invalidated.
-		// They are carried through untouched and the write path rebuilds the row from the currently
-		// stored key, so whatever shape reaches it — mask, stale literal, or omitted section — the
-		// stored tokens win (see Config.operatorKeyRow). This still rejects a mask with no stored
-		// counterpart, so a preview can never reach persistence.
+		// They are carried through as-is, and the write path decides: a pair that still equals the
+		// read-time pair is an echo and the stored rotation wins; a different pair is a new login
+		// and is written through (see lib.Config.operatorOAuthKeyConfig). This still rejects a mask
+		// with no stored counterpart, so a preview can never reach persistence.
 		for _, item := range []struct {
 			incoming *schemas.SecretVar
 			stored   *schemas.SecretVar

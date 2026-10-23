@@ -806,13 +806,34 @@ func TestValidateProviderKeyOAuthKeyConfig(t *testing.T) {
 		{"jwt_bearer missing audience", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.Audience = "" })}, "audience is required"},
 		{"jwt_bearer literal key is not a PEM", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.PrivateKey = schemas.NewSecretVar("not a key") })}, "RSA or EC private key"},
 		{"jwt_bearer env-backed key is not shape checked", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.PrivateKey = schemas.NewSecretVar("env.IDP_KEY") })}, ""},
-		{"an EC key under the default RS256 is refused at save", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P256(), false)); c.SigningAlgorithm = "" })}, "signing_algorithm"},
-		{"an RSA key with ES256 is refused at save", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.PrivateKey = schemas.NewSecretVar(pkcs1TestPEM(t)); c.SigningAlgorithm = "ES256" })}, "signing_algorithm"},
-		{"a P-384 key with ES256 is refused at save", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P384(), false)); c.SigningAlgorithm = "ES256" })}, "signing_algorithm"},
-		{"a P-256 key with ES256 is accepted", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P256(), false)); c.SigningAlgorithm = "ES256" })}, ""},
-		{"a P-384 PKCS#8 key with ES384 is accepted", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P384(), true)); c.SigningAlgorithm = "ES384" })}, ""},
-		{"a P-521 key with ES512 is accepted", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P521(), false)); c.SigningAlgorithm = "ES512" })}, ""},
-		{"an RSA key with PS256 is accepted", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.PrivateKey = schemas.NewSecretVar(pkcs8TestPEM(t)); c.SigningAlgorithm = "PS256" })}, ""},
+		{"an EC key under the default RS256 is refused at save", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) {
+			c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P256(), false))
+			c.SigningAlgorithm = ""
+		})}, "signing_algorithm"},
+		{"an RSA key with ES256 is refused at save", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) {
+			c.PrivateKey = schemas.NewSecretVar(pkcs1TestPEM(t))
+			c.SigningAlgorithm = "ES256"
+		})}, "signing_algorithm"},
+		{"a P-384 key with ES256 is refused at save", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) {
+			c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P384(), false))
+			c.SigningAlgorithm = "ES256"
+		})}, "signing_algorithm"},
+		{"a P-256 key with ES256 is accepted", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) {
+			c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P256(), false))
+			c.SigningAlgorithm = "ES256"
+		})}, ""},
+		{"a P-384 PKCS#8 key with ES384 is accepted", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) {
+			c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P384(), true))
+			c.SigningAlgorithm = "ES384"
+		})}, ""},
+		{"a P-521 key with ES512 is accepted", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) {
+			c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P521(), false))
+			c.SigningAlgorithm = "ES512"
+		})}, ""},
+		{"an RSA key with PS256 is accepted", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) {
+			c.PrivateKey = schemas.NewSecretVar(pkcs8TestPEM(t))
+			c.SigningAlgorithm = "PS256"
+		})}, ""},
 		{"a half block behind a value is still refused", schemas.OpenAI, schemas.Key{Value: *schemas.NewSecretVar("sk"), OAuthKeyConfig: cc(func(c *schemas.OAuthKeyConfig) { c.GrantType = "" })}, "grant_type is required"},
 		{"refused on a provider that does not resolve it", schemas.Anthropic, schemas.Key{Value: *schemas.NewSecretVar("sk"), OAuthKeyConfig: cc(nil)}, "only supported on openai"},
 	}
@@ -2387,8 +2408,14 @@ func TestInstallCodeBuddyCredentialSinkPersistsARotation(t *testing.T) {
 // TestRotatedTokenPersistDoesNotBlockTheRequestPath pins the reason UpdateProviderKeyTokens splits
 // the in-memory apply from the store write. The provider invokes the sink while tokencache holds
 // that credential's slot mutex, so a store write awaited there would stall every concurrent request
-// for that key. The property asserted is the mint's own latency: the call must return long before a
-// slow store answers, with the rotation already applied to memory.
+// for that key.
+//
+// What it asserts is narrowly the mint's latency: the call returns in a fraction of the time a slow
+// store takes, and the write is demonstrably still in flight when it does. It deliberately does not
+// assert that the new token is readable at return, because reading it needs c.Mu and the background
+// write holds that lock while it waits on the store — the token is in memory, but not observable
+// without waiting out the write. The memory assertion below therefore runs after the bounded write
+// finishes.
 //
 // The store stub sleeps far longer than the assertion window, so a synchronous write cannot pass by
 // being fast.
@@ -2455,8 +2482,10 @@ func TestOperatorUpdateKeepsAConcurrentRotation(t *testing.T) {
 		Weight:         1,
 		OAuthKeyConfig: stale.Redacted(),
 	}
-	if err := config.UpdateProviderKey(context.Background(), schemas.CodeBuddyCN, "key-1", operatorKey); err != nil {
-		t.Fatalf("UpdateProviderKey: %v", err)
+	// The read-time block travels with the write, which is how the config layer knows these tokens
+	// are an echo of what was read rather than a new login.
+	if err := config.UpdateProviderKeyWithReadTokens(context.Background(), schemas.CodeBuddyCN, "key-1", operatorKey, stale); err != nil {
+		t.Fatalf("UpdateProviderKeyWithReadTokens: %v", err)
 	}
 
 	got := storedProviderKey(t, config, "key-1").OAuthKeyConfig
@@ -2472,43 +2501,161 @@ func TestOperatorUpdateKeepsAConcurrentRotation(t *testing.T) {
 	}
 }
 
-// TestOperatorUpdateWithExplicitTokensCannotSetTheRotatingFields pins the deliberate consequence of
-// single-writer ownership: access_token, refresh_token and expires_at are minted, never configured.
-// A literal in the request is accepted and ignored, and the stored rotation survives — writing it
-// would only mean the next rotation overwrote it, and a hand-written refresh token is never valid
-// upstream.
-func TestOperatorUpdateWithExplicitTokensCannotSetTheRotatingFields(t *testing.T) {
+// TestOperatorUpdateWritesThroughAFreshLogin pins the legitimate action the single-writer rule must
+// not break: replacing a dead credential by logging in again. The login flow obtains a new pair and
+// saves it through this same endpoint; if the write discarded it, re-authenticating would be a
+// silent no-op and a key with an invalidated refresh token could never be repaired.
+//
+// The new pair differs from what the request read, which is what distinguishes it from an echo.
+func TestOperatorUpdateWritesThroughAFreshLogin(t *testing.T) {
 	SetLogger(&mockLogger{})
 	lib.SetLogger(&mockLogger{})
 
+	store := newTokenWriteStore(schemas.Key{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: browserLoginConfig()})
 	config := &lib.Config{
+		ConfigStore: store,
 		Providers: map[schemas.ModelProvider]configstore.ProviderConfig{
 			schemas.CodeBuddyCN: {Keys: []schemas.Key{{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: browserLoginConfig()}}},
 		},
 	}
 	attachBifrostClient(t, config)
+
+	// The handler's read: the pair the client is shown.
+	readTime, err := config.GetProviderKeyRaw(schemas.CodeBuddyCN, "key-1")
+	if err != nil {
+		t.Fatalf("GetProviderKeyRaw: %v", err)
+	}
+
+	fresh := browserLoginConfig()
+	fresh.AccessToken = schemas.NewSecretVar("access-fresh")
+	fresh.RefreshToken = schemas.NewSecretVar("refresh-fresh")
+	fresh.ExpiresAt = "2026-10-23T09:00:00Z"
+	if err := config.UpdateProviderKeyWithReadTokens(context.Background(), schemas.CodeBuddyCN, "key-1", schemas.Key{
+		ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: fresh,
+	}, readTime.OAuthKeyConfig); err != nil {
+		t.Fatalf("UpdateProviderKeyWithReadTokens: %v", err)
+	}
+
+	inMemory := storedProviderKey(t, config, "key-1").OAuthKeyConfig
+	if inMemory.AccessToken.GetValue() != "access-fresh" || inMemory.RefreshToken.GetValue() != "refresh-fresh" {
+		t.Fatalf("memory tokens = %q/%q, want the fresh pair", inMemory.AccessToken.GetValue(), inMemory.RefreshToken.GetValue())
+	}
+	// The expiry must come from the new pair, not from the row it replaces: a fresh token with a
+	// stale expiry would be re-minted on the very next request.
+	if inMemory.ExpiresAt != "2026-10-23T09:00:00Z" {
+		t.Fatalf("expiry = %q, want the fresh pair's expiry", inMemory.ExpiresAt)
+	}
+
+	store.awaitWrites(t, 1)
+	storedCfg := store.storedKey(t, "key-1").OAuthKeyConfig
+	if storedCfg.AccessToken.GetValue() != "access-fresh" || storedCfg.RefreshToken.GetValue() != "refresh-fresh" || storedCfg.ExpiresAt != "2026-10-23T09:00:00Z" {
+		t.Fatalf("store tokens = %q/%q/%q, want the fresh pair", storedCfg.AccessToken.GetValue(), storedCfg.RefreshToken.GetValue(), storedCfg.ExpiresAt)
+	}
+}
+
+// TestOperatorUpdateKeepsTheStoredRotationWhenThePairIsEchoed is the other half of the same rule: a
+// save whose tokens still match what it read is an echo, so a rotation that landed in between must
+// survive. This is the window the handler's read→merge→write opens, exercised with literal values
+// rather than the mask.
+func TestOperatorUpdateKeepsTheStoredRotationWhenThePairIsEchoed(t *testing.T) {
+	SetLogger(&mockLogger{})
+	lib.SetLogger(&mockLogger{})
+
+	store := newTokenWriteStore(schemas.Key{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: browserLoginConfig()})
+	config := &lib.Config{
+		ConfigStore: store,
+		Providers: map[schemas.ModelProvider]configstore.ProviderConfig{
+			schemas.CodeBuddyCN: {Keys: []schemas.Key{{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: browserLoginConfig()}}},
+		},
+	}
+	attachBifrostClient(t, config)
+
+	readTime, err := config.GetProviderKeyRaw(schemas.CodeBuddyCN, "key-1")
+	if err != nil {
+		t.Fatalf("GetProviderKeyRaw: %v", err)
+	}
+
+	// A refresh rotates the credential after the read.
 	if err := config.UpdateProviderKeyTokens(context.Background(), schemas.CodeBuddyCN, "key-1", "access-2", "refresh-2", "2026-10-22T13:00:00Z"); err != nil {
 		t.Fatalf("UpdateProviderKeyTokens: %v", err)
 	}
+	store.awaitWrites(t, 1)
 
-	replacement := browserLoginConfig()
-	replacement.AccessToken = schemas.NewSecretVar("access-typed")
-	replacement.RefreshToken = schemas.NewSecretVar("refresh-typed")
-	replacement.ExpiresAt = "2027-01-01T00:00:00Z"
-	if err := config.UpdateProviderKey(context.Background(), schemas.CodeBuddyCN, "key-1", schemas.Key{
-		ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: replacement,
-	}); err != nil {
-		t.Fatalf("UpdateProviderKey: %v", err)
+	// The client echoes the literal pair it read, plus a rename.
+	echo := *readTime.OAuthKeyConfig
+	if err := config.UpdateProviderKeyWithReadTokens(context.Background(), schemas.CodeBuddyCN, "key-1", schemas.Key{
+		ID: "key-1", Name: "renamed", Weight: 1, OAuthKeyConfig: &echo,
+	}, readTime.OAuthKeyConfig); err != nil {
+		t.Fatalf("UpdateProviderKeyWithReadTokens: %v", err)
 	}
 
-	got := storedProviderKey(t, config, "key-1").OAuthKeyConfig
-	if got.AccessToken.GetValue() != "access-2" || got.RefreshToken.GetValue() != "refresh-2" || got.ExpiresAt != "2026-10-22T13:00:00Z" {
-		t.Fatalf("the rotating fields must be owned by the rotation sink alone, got %q/%q/%q",
-			got.AccessToken.GetValue(), got.RefreshToken.GetValue(), got.ExpiresAt)
+	inMemory := storedProviderKey(t, config, "key-1")
+	if got := inMemory.OAuthKeyConfig; got.AccessToken.GetValue() != "access-2" || got.RefreshToken.GetValue() != "refresh-2" || got.ExpiresAt != "2026-10-22T13:00:00Z" {
+		t.Fatalf("memory reverted the rotation: %q/%q/%q", got.AccessToken.GetValue(), got.RefreshToken.GetValue(), got.ExpiresAt)
 	}
-	// The rest of the block is still the operator's to edit.
-	if got.TokenURL.GetValue() != replacement.TokenURL.GetValue() {
-		t.Fatalf("a non-rotating oauth field must still be editable, got %q", got.TokenURL.GetValue())
+	if inMemory.Name != "renamed" {
+		t.Fatalf("the rename was lost: %q", inMemory.Name)
+	}
+	storedCfg := store.storedKey(t, "key-1")
+	if got := storedCfg.OAuthKeyConfig; got.RefreshToken.GetValue() != "refresh-2" || got.AccessToken.GetValue() != "access-2" {
+		t.Fatalf("store reverted the rotation: %q/%q", got.AccessToken.GetValue(), got.RefreshToken.GetValue())
+	}
+}
+
+// TestOperatorUpdateAddsOAuthAfterAPastedValue covers the second legitimate action: converting a
+// pasted-key row into a login. There is no stored block to preserve, so the incoming bundle must be
+// written through — including its refresh token, or the key persists in a state that fails at first
+// use while the API has already answered 200.
+func TestOperatorUpdateAddsOAuthAfterAPastedValue(t *testing.T) {
+	SetLogger(&mockLogger{})
+	lib.SetLogger(&mockLogger{})
+
+	pasted := schemas.Key{ID: "key-1", Name: "cb", Weight: 1, Value: *schemas.NewSecretVar("sk-pasted")}
+	store := newTokenWriteStore(pasted)
+	config := &lib.Config{
+		ConfigStore: store,
+		Providers: map[schemas.ModelProvider]configstore.ProviderConfig{
+			schemas.CodeBuddyCN: {Keys: []schemas.Key{pasted}},
+		},
+	}
+	attachBifrostClient(t, config)
+
+	readTime, err := config.GetProviderKeyRaw(schemas.CodeBuddyCN, "key-1")
+	if err != nil {
+		t.Fatalf("GetProviderKeyRaw: %v", err)
+	}
+	if readTime.OAuthKeyConfig != nil {
+		t.Fatal("test setup: the stored key should have no oauth block")
+	}
+
+	login := browserLoginConfig()
+	login.AccessToken = schemas.NewSecretVar("access-login")
+	login.RefreshToken = schemas.NewSecretVar("refresh-login")
+	login.ExpiresAt = "2026-10-23T10:00:00Z"
+	if err := config.UpdateProviderKeyWithReadTokens(context.Background(), schemas.CodeBuddyCN, "key-1", schemas.Key{
+		ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: login,
+	}, readTime.OAuthKeyConfig); err != nil {
+		t.Fatalf("UpdateProviderKeyWithReadTokens: %v", err)
+	}
+
+	inMemory := storedProviderKey(t, config, "key-1")
+	if inMemory.OAuthKeyConfig == nil {
+		t.Fatal("the oauth block was dropped")
+	}
+	if inMemory.OAuthKeyConfig.RefreshToken.GetValue() != "refresh-login" {
+		t.Fatalf("refresh token = %q, want the login's; a token-less bundle would fail at first use", inMemory.OAuthKeyConfig.RefreshToken.GetValue())
+	}
+	if inMemory.OAuthKeyConfig.AccessToken.GetValue() != "access-login" || inMemory.OAuthKeyConfig.ExpiresAt != "2026-10-23T10:00:00Z" {
+		t.Fatalf("the login's access token/expiry were not persisted: %q/%q", inMemory.OAuthKeyConfig.AccessToken.GetValue(), inMemory.OAuthKeyConfig.ExpiresAt)
+	}
+	// It must be usable: the provider requires the browser_login grant to mint from.
+	if err := inMemory.OAuthKeyConfig.Validate(); err != nil {
+		t.Fatalf("the persisted bundle does not validate: %v", err)
+	}
+
+	store.awaitWrites(t, 1)
+	if got := store.storedKey(t, "key-1").OAuthKeyConfig; got == nil || got.RefreshToken.GetValue() != "refresh-login" {
+		t.Fatalf("the store did not receive the login: %+v", got)
 	}
 }
 
@@ -2559,9 +2706,9 @@ func TestRenameOnlySavePreservesTheRotatedTokens(t *testing.T) {
 		t.Fatalf("test setup: the merge was expected to carry the stale literal, got %q", merged.OAuthKeyConfig.RefreshToken.GetValue())
 	}
 
-	// Stage 4: the handler's write.
-	if err := config.UpdateProviderKey(context.Background(), schemas.CodeBuddyCN, "key-1", merged); err != nil {
-		t.Fatalf("UpdateProviderKey: %v", err)
+	// Stage 4: the handler's write, carrying the block it read.
+	if err := config.UpdateProviderKeyWithReadTokens(context.Background(), schemas.CodeBuddyCN, "key-1", merged, readTime.OAuthKeyConfig); err != nil {
+		t.Fatalf("UpdateProviderKeyWithReadTokens: %v", err)
 	}
 
 	inMemory := storedProviderKey(t, config, "key-1")
@@ -2580,17 +2727,15 @@ func TestRenameOnlySavePreservesTheRotatedTokens(t *testing.T) {
 	}
 }
 
-// TestSlowRotationPersistDoesNotClobberALaterEdit is Finding B's exact reproduction: the rotation's
-// row write is slow, and an operator's rename arrives while it is in flight.
+// TestSlowRotationPersistDoesNotClobberALaterEdit pins the observable outcome of Finding B: a slow
+// rotation write overlapping an operator rename must leave the durable row carrying both changes.
 //
-// The fix orders the two writers rather than letting the rotation write a snapshot captured when it
-// was scheduled. Concretely the rotation now builds its row from memory at write time under c.Mu,
-// so the rename either lands before that build (and is carried into the rotation's own row) or
-// waits for the rotation's write to finish (and lands after it). Either way the last write to the
-// store is a row that includes both changes, and memory and store agree.
-//
-// The pre-fix behaviour fails this: with the row captured at apply time, the rotation's late write
-// restored the pre-edit name, so the durable row read "cb" while memory read "renamed".
+// It does not force a particular interleaving. With the fix both writers serialize on c.Mu and each
+// builds its row from the state the previous one left, so the rename is either already in memory
+// when the rotation builds its row or is written after it; either way the last write includes both.
+// The failure it catches is the structural one: if the rotation wrote a row captured when it was
+// scheduled, the rename would be reverted in the store (durable row "cb", memory "renamed") — which
+// is exactly what the mutation check in the report reproduces.
 func TestSlowRotationPersistDoesNotClobberALaterEdit(t *testing.T) {
 	SetLogger(&mockLogger{})
 	lib.SetLogger(&mockLogger{})
@@ -2646,7 +2791,11 @@ func TestSlowRotationPersistDoesNotClobberALaterTokenEdit(t *testing.T) {
 	lib.SetLogger(&mockLogger{})
 
 	store := newTokenWriteStore(schemas.Key{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: browserLoginConfig()})
-	store.persistDelay = 150 * time.Millisecond
+	// Staggered so the OLDER write lands last if the row were captured when the rotation was
+	// applied: the first rotation's write sleeps 300ms, the second's is immediate. With a
+	// captured-at-apply snapshot that ordering ends on access-2/refresh-2 — the superseded pair,
+	// whose refresh token upstream has already invalidated.
+	store.updateDelays = []time.Duration{300 * time.Millisecond, 0}
 	config := &lib.Config{
 		ConfigStore: store,
 		Providers: map[schemas.ModelProvider]configstore.ProviderConfig{
@@ -2661,11 +2810,18 @@ func TestSlowRotationPersistDoesNotClobberALaterTokenEdit(t *testing.T) {
 		t.Fatalf("second rotation: %v", err)
 	}
 
-	require.Eventually(t, func() bool {
-		cfg := store.storedKey(t, "key-1").OAuthKeyConfig
-		return cfg.RefreshToken.GetValue() == "refresh-3"
-	}, 5*time.Second, 5*time.Millisecond, "the store never adopted the newer rotation")
-	if got := store.storedKey(t, "key-1").OAuthKeyConfig.AccessToken.GetValue(); got != "access-3" {
-		t.Fatalf("store access token = %q, want the newer access-3", got)
+	// Wait for both writes to land. Asserting on an intermediate state would pass spuriously:
+	// the newer write lands first here, so catching it early says nothing about the older one
+	// that is still sleeping.
+	store.awaitWrites(t, 2)
+
+	final := store.storedKey(t, "key-1").OAuthKeyConfig
+	if final.RefreshToken.GetValue() != "refresh-3" || final.AccessToken.GetValue() != "access-3" {
+		t.Fatalf("store tokens = %q/%q, want the newer access-3/refresh-3", final.AccessToken.GetValue(), final.RefreshToken.GetValue())
+	}
+	// Memory must agree with the store; a disagreement is what a restart would surface.
+	inMemory := storedProviderKey(t, config, "key-1").OAuthKeyConfig
+	if inMemory.RefreshToken.GetValue() != final.RefreshToken.GetValue() || inMemory.AccessToken.GetValue() != final.AccessToken.GetValue() {
+		t.Fatalf("memory %q/%q disagrees with store %q/%q", inMemory.AccessToken.GetValue(), inMemory.RefreshToken.GetValue(), final.AccessToken.GetValue(), final.RefreshToken.GetValue())
 	}
 }

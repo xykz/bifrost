@@ -8882,11 +8882,15 @@ func (c *Config) applyProviderKeyTokens(provider schemas.ModelProvider, keyID, a
 // client that happened to trigger it hangs up.
 func (c *Config) persistProviderKeyTokens(store configstore.ConfigStore, provider schemas.ModelProvider, keyID string) {
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), TokenPersistTimeout)
-		defer cancel()
-
 		c.Mu.Lock()
 		defer c.Mu.Unlock()
+
+		// The budget starts after the lock, not before it. A queued write may wait behind another
+		// key write for an unbounded time; charging that wait to TokenPersistTimeout would let a
+		// write be dropped for having been scheduled during a slow one, which is not what the
+		// budget is for. What it bounds is the store call.
+		ctx, cancel := context.WithTimeout(context.Background(), TokenPersistTimeout)
+		defer cancel()
 
 		existingConfig, exists := c.Providers[provider]
 		if !exists {
@@ -8944,19 +8948,17 @@ func skipDBUpdate(ctx context.Context) bool {
 // right now and copies over only the fields the key-edit API owns, so a save can never carry a
 // stale copy of anything else.
 //
-// The three rotating credential fields are the reason this exists. access_token, refresh_token and
-// expires_at are minted by the login flow and rewritten by every rotation; they are not
-// configuration. Two writers touching one row as whole-key snapshots meant the later write silently
-// reverted the other: a rename/weight-only save carried the tokens the handler read before the
-// rotation, and persisting those restored the refresh token upstream had already invalidated.
-// Giving the token fields exactly one writer (the rotation sink) closes that structurally, whatever
-// shape the request body takes — omitted section, redacted mask, or a stale literal.
+// The three rotating credential fields are the reason the copying happens field by field. They are
+// minted by the login flow and rewritten by every rotation, so they are owned by a different writer
+// than the rest of the row. A save that merely echoes what it read — a rename, a weight edit, a
+// masked preview — must not revert a rotation that landed in between, while a save that carries a
+// genuinely new pair (a re-login) must be written through. `readTokens` is how the caller
+// distinguishes the two: it is the OAuth block as the caller read it, or nil when the caller has no
+// such snapshot and the incoming tokens are simply authoritative.
 //
-// Consequence, deliberate: an operator cannot set or clear these three fields through the key-edit
-// API. Sending them is accepted and ignored, and the stored values are preserved. That is correct,
-// because a hand-written access token would simply be overwritten by the next rotation, and a
-// hand-written refresh token is never valid upstream.
-func operatorKeyRow(incoming, stored schemas.Key) schemas.Key {
+// Anything not listed here (ID, Status, ConfigHash) comes from `stored`: none of it is editable
+// through the API, and Status is owned by health tracking.
+func operatorKeyRow(incoming, stored schemas.Key, readTokens *schemas.OAuthKeyConfig) schemas.Key {
 	row := stored
 	row.Name = incoming.Name
 	row.Value = incoming.Value
@@ -8975,29 +8977,42 @@ func operatorKeyRow(incoming, stored schemas.Key) schemas.Key {
 	row.DatabricksKeyConfig = incoming.DatabricksKeyConfig
 	row.GithubCopilotKeyConfig = incoming.GithubCopilotKeyConfig
 	row.CloudflareKeyConfig = incoming.CloudflareKeyConfig
-	row.OAuthKeyConfig = operatorOAuthKeyConfig(incoming.OAuthKeyConfig, stored.OAuthKeyConfig)
+	row.OAuthKeyConfig = operatorOAuthKeyConfig(incoming.OAuthKeyConfig, stored.OAuthKeyConfig, readTokens)
 	row.Enabled = incoming.Enabled
 	row.UseForBatchAPI = incoming.UseForBatchAPI
 	row.UseAnthropicEndpoints = incoming.UseAnthropicEndpoints
 	row.UseOpenAIEndpoints = incoming.UseOpenAIEndpoints
 	row.Description = incoming.Description
-	// ID, Status and ConfigHash come from `stored`: none of them is editable through the API, and
-	// Status is owned by health tracking.
 	return row
 }
 
-// operatorOAuthKeyConfig applies an operator's edits to the OAuth block while keeping the rotating
-// tokens exactly as stored. A nil incoming block is an explicit clear and is honoured; there are no
-// stored tokens to preserve in that case.
-func operatorOAuthKeyConfig(incoming, stored *schemas.OAuthKeyConfig) *schemas.OAuthKeyConfig {
+// operatorOAuthKeyConfig decides whether a save's rotating tokens are written through or replaced
+// by the stored pair.
+//
+// The rule is about provenance, not about distrusting every save. If the incoming pair still equals
+// the pair the caller read, the client is echoing what it was given — typically because it never
+// touched the section, or because it sent the mask it was shown — and the stored pair wins, since a
+// rotation may have replaced it in between and upstream has invalidated the old refresh token.
+// If the pair differs from what was read, the caller is supplying a new credential (a re-login),
+// and it is written through together with its own expiry.
+//
+// Both tokens are decided as a pair: a fresh login carries an access token and a refresh token from
+// the same exchange, so mixing one echoed and one new value would store a combination that never
+// existed. When there is nothing stored there is nothing to preserve, so the incoming pair is
+// written through — that is what makes "add a login to a key that previously used a pasted value"
+// work.
+func operatorOAuthKeyConfig(incoming, stored, readTokens *schemas.OAuthKeyConfig) *schemas.OAuthKeyConfig {
 	if incoming == nil {
+		// An explicit null clears the block; there is nothing left to preserve.
 		return nil
 	}
 	cfg := *incoming
-	if stored == nil {
-		cfg.AccessToken = nil
-		cfg.RefreshToken = nil
-		cfg.ExpiresAt = ""
+	if stored == nil || readTokens == nil {
+		// Nothing stored, or no read snapshot to compare against: the save is authoritative.
+		return &cfg
+	}
+	if !tokenEchoesRead(incoming.AccessToken, readTokens.AccessToken) ||
+		!tokenEchoesRead(incoming.RefreshToken, readTokens.RefreshToken) {
 		return &cfg
 	}
 	cfg.AccessToken = stored.AccessToken
@@ -9006,8 +9021,43 @@ func operatorOAuthKeyConfig(incoming, stored *schemas.OAuthKeyConfig) *schemas.O
 	return &cfg
 }
 
-// UpdateProviderKey updates a single key on an existing provider configuration.
+// tokenEchoesRead reports whether an incoming token is the one the caller read: the same value, a
+// redacted preview of it, or absent (an omitted or null field, which carries no new credential).
+// A nil read value means there was nothing to echo, so any incoming token counts as new.
+func tokenEchoesRead(incoming, read *schemas.SecretVar) bool {
+	if read == nil {
+		return false
+	}
+	if incoming == nil {
+		return true
+	}
+	if incoming.IsMaskedPlaceholder() {
+		return true
+	}
+	return incoming.GetValue() == read.GetValue()
+}
+
+// UpdateProviderKey updates a single key on an existing provider configuration. The incoming key's
+// rotating OAuth tokens are authoritative: use this when the caller is the source of the credential
+// rather than echoing one it read earlier.
 func (c *Config) UpdateProviderKey(ctx context.Context, provider schemas.ModelProvider, keyID string, key schemas.Key) error {
+	return c.updateProviderKey(ctx, provider, keyID, key, nil)
+}
+
+// UpdateProviderKeyWithReadTokens updates a key whose rotating OAuth tokens may be an echo of the
+// values the caller read. readTokens is the OAuth block as it was read before the caller built its
+// update; when the incoming tokens still match it, the currently stored rotation wins, and when they
+// differ the incoming pair is written through (a re-login).
+//
+// It is a separate entry point rather than a parameter on UpdateProviderKey so the rule is opt-in:
+// every other caller supplies a credential it owns and needs no knowledge of rotation. Only the
+// key-edit handler, which reads, merges and writes, can tell an echo from a new login.
+func (c *Config) UpdateProviderKeyWithReadTokens(ctx context.Context, provider schemas.ModelProvider, keyID string, key schemas.Key, readTokens *schemas.OAuthKeyConfig) error {
+	return c.updateProviderKey(ctx, provider, keyID, key, readTokens)
+}
+
+// updateProviderKey is the shared body of the two entry points above.
+func (c *Config) updateProviderKey(ctx context.Context, provider schemas.ModelProvider, keyID string, key schemas.Key, readTokens *schemas.OAuthKeyConfig) error {
 	c.Mu.Lock()
 	defer c.Mu.Unlock()
 
@@ -9025,7 +9075,7 @@ func (c *Config) UpdateProviderKey(ctx context.Context, provider schemas.ModelPr
 
 	updatedConfig := existingConfig
 	updatedConfig.Keys = append([]schemas.Key(nil), existingConfig.Keys...)
-	key = operatorKeyRow(key, existingConfig.Keys[index])
+	key = operatorKeyRow(key, existingConfig.Keys[index], readTokens)
 	key.ID = keyID
 	updatedConfig.Keys[index] = key
 
