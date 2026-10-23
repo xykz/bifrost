@@ -404,10 +404,14 @@ export const oauthKeyConfigComplete = (data: Record<string, unknown> | undefined
 		private_key?: { value?: string; ref?: string };
 		issuer?: string;
 		audience?: string;
+		refresh_token?: { value?: string; ref?: string };
 	};
 	if (!isSecretVarSet(d.token_url)) return false;
 	if (d.grant_type === "client_credentials") return isSecretVarSet(d.client_id) && isSecretVarSet(d.client_secret);
 	if (d.grant_type === "jwt_bearer") return isSecretVarSet(d.private_key) && !!d.issuer?.trim() && !!d.audience?.trim();
+	// browser_login: the refresh token is the durable credential. The access token may be absent
+	// until the first refresh, and an empty expires_at means "refresh on use" on the server.
+	if (d.grant_type === "browser_login") return isSecretVarSet(d.refresh_token);
 	return false;
 };
 
@@ -472,13 +476,31 @@ const isLiteralHTTPSOrLoopbackURL = (v: { value?: string; ref?: string; type?: s
 	}
 };
 
-// OAuth key config schema. Honoured by openai-based providers: the key value may be empty
-// when this block is whole for its grant. Literal values are shape-checked so a typo fails in
-// the form rather than at the first inference call; references resolve elsewhere.
+// A browser-login expiry is stored verbatim and parsed by the server with time.Parse(time.RFC3339),
+// so the form rejects what that layout cannot read. Go accepts fractional seconds and gives the
+// zone offset no range check, so neither is enforced here; the calendar date is, because Go
+// rejects 2026-02-30 and a form that lets it through would 400 on save.
+const RFC3339_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+const isRFC3339 = (value: string): boolean => {
+	const match = RFC3339_PATTERN.exec(value.trim());
+	if (!match) return false;
+	const [year, month, day, hour, minute, second] = match.slice(1, 7).map(Number);
+	if (month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59) return false;
+	// The month length is computed from the leap-year rule rather than with Date.UTC, which maps
+	// years 0-99 to 1900-1999; Go's time.Parse has no such quirk and rejects 2026-02-30.
+	const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+	const daysInMonth = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+	return day >= 1 && day <= daysInMonth;
+};
+
+// OAuth key config schema. Honoured by openai-based providers and by codebuddy-cn: the key
+// value may be empty when this block is whole for its grant. Literal values are shape-checked
+// so a typo fails in the form rather than at the first inference call; references resolve
+// elsewhere.
 export const oauthKeyConfigSchema = z
 	.object({
 		_auth_type: z.enum(["api_key", "oauth"]).optional(),
-		grant_type: z.enum(["client_credentials", "jwt_bearer"]).optional(),
+		grant_type: z.enum(["client_credentials", "jwt_bearer", "browser_login"]).optional(),
 		token_url: secretVarSchema.optional(),
 		client_id: secretVarSchema.optional(),
 		client_secret: secretVarSchema.optional(),
@@ -491,6 +513,11 @@ export const oauthKeyConfigSchema = z
 		signing_algorithm: z.enum(["RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512"]).optional(),
 		auth_style: z.enum(["header", "body"]).optional(),
 		extra_params: z.record(z.string(), z.string()).optional(),
+		// browser_login: the durable credential is the refresh token; the access token is
+		// rewritten on every refresh, and an empty expires_at means "refresh on use".
+		access_token: secretVarSchema.optional(),
+		refresh_token: secretVarSchema.optional(),
+		expires_at: z.string().optional(),
 		// Range-checked in superRefine, only while JWT bearer is active: the field is hidden on
 		// the other tabs, and a stale value in it must not block saving. 0 means "default".
 		assertion_lifetime_seconds: z.number().int().optional(),
@@ -503,7 +530,8 @@ export const oauthKeyConfigSchema = z
 			isSecretVarSet(data.token_url) ||
 			isSecretVarSet(data.client_id) ||
 			isSecretVarSet(data.client_secret) ||
-			isSecretVarSet(data.private_key);
+			isSecretVarSet(data.private_key) ||
+			isSecretVarSet(data.refresh_token);
 		if (!started) return;
 		if (!data.grant_type) {
 			ctx.addIssue({ code: "custom", path: ["grant_type"], message: "Choose a grant type" });
@@ -546,6 +574,16 @@ export const oauthKeyConfigSchema = z
 					path: ["assertion_lifetime_seconds"],
 					message: "Assertion lifetime must be between 1 and 3600 seconds (0 for the default)",
 				});
+			}
+		}
+		// The refresh token is the durable credential: without it the bundle can never mint an
+		// access token, and the server's Validate() refuses it.
+		if (data.grant_type === "browser_login") {
+			if (!isSecretVarSet(data.refresh_token)) {
+				ctx.addIssue({ code: "custom", path: ["refresh_token"], message: "Refresh token is required for a browser login" });
+			}
+			if (data.expires_at && !isRFC3339(data.expires_at)) {
+				ctx.addIssue({ code: "custom", path: ["expires_at"], message: "Expiry must be an RFC3339 timestamp" });
 			}
 		}
 	});

@@ -218,6 +218,20 @@ const ReplicateKeyConfigSchema = z.object({
 	use_deployments_endpoint: z.boolean().optional(),
 });
 
+// codebuddy-cn's browser-login credential: the shared OAuth block narrowed to the only grant
+// the server accepts for this provider. Task 9 types the login modal's `onSuccess` payload with
+// it; `codebuddyCNOAuthComplete` is the single source of truth for "this bundle is usable".
+export const codebuddyCNOAuthSchema = oauthKeyConfigSchema.safeExtend({
+	grant_type: z.literal("browser_login"),
+});
+
+// codebuddyCNOAuthComplete reports whether a key's oauth_key_config is a usable browser-login
+// bundle. Judging it through the schema means "complete" cannot drift from what the form accepts:
+// a bundle without a refresh token, or with an unparseable expiry, is not usable. The parameter is
+// `unknown` so the login modal can pass a freshly built payload without a cast.
+export const codebuddyCNOAuthComplete = (cfg: unknown): boolean =>
+	!!cfg && typeof cfg === "object" && codebuddyCNOAuthSchema.safeParse(cfg).success;
+
 const KeySchema = z.object({
 	id: z.string(),
 	name: z.string().min(1, "Name is required for the key"),
@@ -234,6 +248,10 @@ const KeySchema = z.object({
 	bedrock_mantle_key_config: BedrockMantleKeyConfigSchema.optional(),
 	replicate_key_config: ReplicateKeyConfigSchema.optional(),
 	github_copilot_key_config: githubCopilotKeyConfigSchema.optional(),
+	// Deliberately the shared block, not codebuddyCNOAuthSchema: this key schema is
+	// provider-agnostic, so narrowing the field here would reject every openai key's
+	// client_credentials/jwt_bearer bundle. The codebuddy-cn branch below narrows it to
+	// browser_login, and keeps the per-field messages the shared block already produces.
 	oauth_key_config: oauthKeyConfigSchema.optional(),
 	use_for_batch_api: z.boolean().optional(),
 });
@@ -328,6 +346,49 @@ export const ProviderFormSchema = z
 			// Validate individual key values based on provider type
 			const effectiveProviderType = data.baseProviderType || data.selectedProvider;
 			data.keys.forEach((key, index) => {
+				// codebuddy-cn has exactly two auth modes and the server refuses any other
+				// combination: a pasted API key (X-API-Key) or a browser_login bundle
+				// (Authorization). Both would persist a key whose configured login is silently
+				// unused; neither leaves a key that can never authenticate.
+				if (effectiveProviderType === "codebuddy-cn") {
+					const hasValue = !!key.value.trim();
+					// An `_auth_type: "api_key"` block is the inert placeholder the key form
+					// registers; the save path strips it, so the server never sees it and it must
+					// not count as a second auth mode here either.
+					const oauth = key.oauth_key_config?._auth_type === "api_key" ? undefined : key.oauth_key_config;
+					if (hasValue && oauth) {
+						ctx.addIssue({
+							code: z.ZodIssueCode.custom,
+							message: "A CodeBuddy CN key takes either a pasted API key or an OAuth login, not both",
+							path: ["keys", index, "oauth_key_config"],
+						});
+					} else if (!hasValue && !oauth) {
+						ctx.addIssue({
+							code: z.ZodIssueCode.custom,
+							message: "Paste an API key or sign in with OAuth",
+							path: ["keys", index, "value"],
+						});
+					} else if (oauth) {
+						// The shared block accepts every grant, so a client_credentials or
+						// jwt_bearer bundle has to be refused here: only browser_login is valid.
+						if (oauth.grant_type !== "browser_login") {
+							ctx.addIssue({
+								code: z.ZodIssueCode.custom,
+								message: "CodeBuddy CN keys use the browser login grant",
+								path: ["keys", index, "oauth_key_config", "grant_type"],
+							});
+						} else if (!codebuddyCNOAuthComplete(oauth)) {
+							// With no pasted value this block is the only credential, so a partial
+							// bundle would save a key that can never authenticate.
+							ctx.addIssue({
+								code: z.ZodIssueCode.custom,
+								message: "The OAuth login is incomplete; sign in again",
+								path: ["keys", index, "oauth_key_config"],
+							});
+						}
+					}
+					return;
+				}
 				// GitHub Copilot is checked separately below: the credential can live entirely
 				// in github_copilot_key_config, so an empty top-level value is only a fault
 				// when the App credentials are absent too.

@@ -224,6 +224,33 @@ export const ProviderIcons = {
 		);
 	},
 
+	// CodeBuddy CN's mark. The provider string is the lookup key (resolveProviderIconKey does an
+	// exact own-property lookup), so the entry is "codebuddy-cn", not "codebuddy". It is drawn in
+	// currentColor so it follows the surrounding text in both themes.
+	"codebuddy-cn": ({ size = "md", className = "" }: IconProps) => {
+		const resolvedSize = resolveSize(size);
+		return (
+			<svg
+				width={resolvedSize}
+				height={resolvedSize}
+				viewBox="0 0 28 28"
+				fill="none"
+				xmlns="http://www.w3.org/2000/svg"
+				className={className}
+			>
+				<title>CodeBuddy CN</title>
+				<rect x="2.5" y="2.5" width="23" height="23" rx="6" stroke="currentColor" strokeWidth="2.4" />
+				<path
+					d="M11.6 10.2 8 14l3.6 3.8M16.4 10.2 20 14l-3.6 3.8"
+					stroke="currentColor"
+					strokeWidth="2.4"
+					strokeLinecap="round"
+					strokeLinejoin="round"
+				/>
+			</svg>
+		);
+	},
+
 	elevenlabs: ({ size = "md", className = "" }: IconProps) => {
 		const resolvedSize = resolveSize(size);
 

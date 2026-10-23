@@ -298,10 +298,10 @@ export const DefaultGithubCopilotKeyConfig: GithubCopilotKeyConfig = {
 	github_domain: { value: "", ref: "" },
 } as const satisfies Required<GithubCopilotKeyConfig>;
 
-// OAuthKeyConfig matching Go's schemas.OAuthKeyConfig. Honoured by openai and by custom
-// providers whose base_provider_type is openai: with an empty key value, Bifrost mints the
-// bearer from the token endpoint and refreshes it before expiry.
-export type OAuthGrantType = "client_credentials" | "jwt_bearer";
+// OAuthKeyConfig matching Go's schemas.OAuthKeyConfig. Honoured by openai, by custom
+// providers whose base_provider_type is openai, and by codebuddy-cn: with an empty key value,
+// Bifrost mints the bearer from the token endpoint and refreshes it before expiry.
+export type OAuthGrantType = "client_credentials" | "jwt_bearer" | "browser_login";
 export type OAuthAuthStyle = "header" | "body";
 export type OAuthSigningAlgorithm = "RS256" | "RS384" | "RS512" | "PS256" | "PS384" | "PS512" | "ES256" | "ES384" | "ES512";
 export const OAuthSigningAlgorithms: OAuthSigningAlgorithm[] = [
@@ -330,6 +330,11 @@ export interface OAuthKeyConfig {
 	auth_style?: OAuthAuthStyle;
 	extra_params?: Record<string, string>;
 	assertion_lifetime_seconds?: number;
+	// browser_login: the access token is refreshed before its expiry; the refresh token is the
+	// durable credential and expires_at is RFC3339 (empty means refresh on use).
+	access_token?: SecretVar;
+	refresh_token?: SecretVar;
+	expires_at?: string;
 	// UI-only discriminator; not sent to the API.
 	_auth_type?: "api_key" | "oauth";
 }
@@ -350,6 +355,9 @@ export const DefaultOAuthKeyConfig: OAuthKeyConfig = {
 	auth_style: "header",
 	extra_params: {},
 	assertion_lifetime_seconds: 300,
+	access_token: { value: "", ref: "" },
+	refresh_token: { value: "", ref: "" },
+	expires_at: "",
 	_auth_type: "api_key",
 } as const satisfies Required<OAuthKeyConfig>;
 
