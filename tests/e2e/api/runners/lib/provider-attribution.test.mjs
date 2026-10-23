@@ -89,4 +89,41 @@ test("a Vertex heading that also mentions Gemini stays with vertex", () => {
   );
 });
 
+// codebuddy-cn is the smoke row's fork, and it is hyphenated, so the partition
+// name itself is the only signal: the row routes through the shared
+// /v1/chat/completions and nothing else on the line names the provider. Without
+// an entry here the row attributed to null, its port stayed at 0 total, and
+// finalizeStatuses reported the fork as "skipped" - a green table that tested
+// nothing.
+test("a codebuddy-cn row attributes and counts on both sides", () => {
+  const cnMatch = makeMatchProvider((p) => ["openai", "deepseek", "codebuddy-cn"].includes(p));
+  const folder = "8.2.A Native /v1/chat/completions streaming × all providers";
+  const row = {
+    name: "codebuddy-cn/hunyuan-chat",
+    request: {
+      url: { raw: "{{baseUrl}}/v1/chat/completions" },
+      body: { raw: '{"model":"codebuddy-cn/hunyuan-chat","stream":true}' },
+    },
+  };
+  assert.strictEqual(providerOfItem(row, [folder], cnMatch), "codebuddy-cn");
+  // The URL line alone names no provider — it is the shared /v1/chat/completions — so the monitor's
+  // fallback to the "↳ codebuddy-cn/hunyuan-chat" name is what attributes it. Both halves are
+  // asserted, because attributing the URL by accident would be a different (fragile) signal.
+  assert.strictEqual(
+    providerOfLogLine("POST http://localhost:8080/v1/chat/completions [200 OK, 1.1kB, 910ms]", folder, cnMatch),
+    null
+  );
+  assert.strictEqual(providerOfLogLine("codebuddy-cn/hunyuan-chat", folder, cnMatch), "codebuddy-cn");
+});
+
+// The hyphen is load-bearing: "codebuddy-cn" must not be claimed by a bare
+// "codebuddy" keyword somebody might add later, and the underscore spelling is a
+// config identifier, not a row name, so both spellings are listed explicitly.
+test("a codebuddy-cn directory-style label is still codebuddy-cn", () => {
+  const cnMatch = makeMatchProvider((p) => ["codebuddy-cn"].includes(p));
+  assert.strictEqual(providerOfLogLine("POST http://x/y [200 ok, 1kb, 9ms]", "CodeBuddy CN (codebuddy-cn)", cnMatch), "codebuddy-cn");
+  assert.strictEqual(providerOfLogLine("POST http://x/y [200 ok, 1kb, 9ms]", "CodeBuddy CN (codebuddy_cn)", cnMatch), "codebuddy-cn");
+  assert.strictEqual(providerOfLogLine("POST http://x/y [200 ok, 1kb, 9ms]", "CodeBuddy", cnMatch), null);
+});
+
 console.log(`\n${passed} passed`);

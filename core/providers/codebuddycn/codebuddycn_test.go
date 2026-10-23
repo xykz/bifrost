@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bytedance/sonic"
 	"github.com/maximhq/bifrost/core/providers/openai"
 	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
 	"github.com/maximhq/bifrost/core/schemas"
@@ -766,12 +767,16 @@ func TestListModelsFallsBackToThePinnedCatalogOnAnUnreadableBody(t *testing.T) {
 // the captured raw body and the recorded response headers all have to be filled in. Without that the
 // one branch that answers from a static list is the one branch an operator cannot see.
 func TestCatalogAnswerRecordsTheSameTelemetryAsALiveListing(t *testing.T) {
+	// The body is whitespace-padded JSON, so the recorded bytes prove the compaction: the live
+	// listing stores compactRawJSON(body), and a catalog answer that stored the body verbatim would
+	// differ by exactly this padding.
+	paddedBody := `{"message": "not found",` + "\n" + `  "detail": "no catalogue"}`
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Slow enough that a recorded latency cannot be mistaken for the zero value.
 		time.Sleep(15 * time.Millisecond)
 		w.Header().Set("X-Upstream-Trace", "trace-1")
 		w.WriteHeader(http.StatusNotFound)
-		_, _ = w.Write([]byte(`{"message":"not found"}`))
+		_, _ = w.Write([]byte(paddedBody))
 	}))
 	defer server.Close()
 
@@ -793,6 +798,98 @@ func TestCatalogAnswerRecordsTheSameTelemetryAsALiveListing(t *testing.T) {
 	headers, ok := ctx.Value(schemas.BifrostContextKeyProviderResponseHeaders).(map[string]string)
 	require.True(t, ok, "the upstream response headers must be recorded on the catalog branch too")
 	require.Equal(t, "trace-1", headers["X-Upstream-Trace"])
+
+	// The multi-key helper aggregates each key's raw body into a slice, so unwrap the one entry.
+	rawList, ok := response.ExtraFields.RawResponse.([]interface{})
+	require.True(t, ok, "the catalog branch must record the raw body the same way the live listing does")
+	require.Len(t, rawList, 1)
+	raw, ok := rawList[0].(json.RawMessage)
+	require.True(t, ok)
+	require.NotContains(t, string(raw), "\n", "the recorded body must be compacted like the live path's")
+	require.JSONEq(t, paddedBody, string(raw))
+
+	// The bytes must be exactly what the live listing path produces for the same body, not merely
+	// "some valid JSON": that equality is what the code comment claims and what a log comparison
+	// between the two branches depends on.
+	var liveListing openai.OpenAIListModelsResponse
+	_, liveRaw, liveErr := providerUtils.HandleProviderResponse([]byte(paddedBody), &liveListing, nil, false, true)
+	require.Nil(t, liveErr)
+	require.Equal(t, liveRaw, raw, "the catalog branch must write the live path's exact bytes for the same body")
+
+	// And the per-request override must reach this branch too: the live path gates on
+	// ShouldSendBackRawResponse, so a catalog answer that read p.sendBackRawResponse would silently
+	// ignore x-bf-send-back-raw-response in both directions.
+	off, err := NewCodeBuddyCNProvider(&schemas.ProviderConfig{
+		NetworkConfig:       schemas.NetworkConfig{DefaultRequestTimeoutInSeconds: 30, BaseURL: server.URL},
+		SendBackRawResponse: true,
+	}, &testLogger{})
+	require.NoError(t, err)
+	overrideCtx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	overrideCtx.SetValue(schemas.BifrostContextKeyCaptureRawResponse, false)
+	overridden, bErr := off.ListModels(overrideCtx, keys, &schemas.BifrostListModelsRequest{})
+	require.Nil(t, bErr)
+	require.Nil(t, overridden.ExtraFields.RawResponse, "the per-request capture override must gate the catalog branch")
+
+	// The other direction: capture off by default, opted in per request.
+	on, err := NewCodeBuddyCNProvider(&schemas.ProviderConfig{
+		NetworkConfig: schemas.NetworkConfig{DefaultRequestTimeoutInSeconds: 30, BaseURL: server.URL},
+	}, &testLogger{})
+	require.NoError(t, err)
+	optInCtx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	optInCtx.SetValue(schemas.BifrostContextKeyCaptureRawResponse, true)
+	optedIn, bErr := on.ListModels(optInCtx, keys, &schemas.BifrostListModelsRequest{})
+	require.Nil(t, bErr)
+	rawOptIn, ok := optedIn.ExtraFields.RawResponse.([]interface{})
+	require.True(t, ok, "x-bf-send-back-raw-response: true must enable the catalog branch's raw body")
+	require.Len(t, rawOptIn, 1)
+	require.JSONEq(t, paddedBody, string(rawOptIn[0].(json.RawMessage)))
+}
+
+// TestCatalogAnswerAlwaysSerializesWithRawCaptureOn is regression 2. The catalog exists to answer
+// when the live listing cannot be read, and its answer is serialized with sonic by every transport.
+// Putting an unreadable body (HTML, plain text) into a json.RawMessage made that serialization fail
+// with "invalid character '<'", so the one branch that was supposed to answer returned a 500 — and
+// the harness profile enables send_back_raw_response for this provider, making that the default.
+func TestCatalogAnswerAlwaysSerializesWithRawCaptureOn(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"404 html", http.StatusNotFound, `<html><body>404 Not Found</body></html>`},
+		{"200 unparseable", http.StatusOK, `<html><body>maintenance</body></html>`},
+		{"404 plain text", http.StatusNotFound, `no catalogue here`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/html")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+
+			p, err := NewCodeBuddyCNProvider(&schemas.ProviderConfig{
+				NetworkConfig:       schemas.NetworkConfig{DefaultRequestTimeoutInSeconds: 30, BaseURL: server.URL},
+				SendBackRawResponse: true,
+			}, &testLogger{})
+			require.NoError(t, err)
+
+			ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+			keys := []schemas.Key{{Value: *schemas.NewSecretVar("sk-pasted"), Models: schemas.WhiteList{"*"}}}
+
+			response, bErr := p.ListModels(ctx, keys, &schemas.BifrostListModelsRequest{})
+			require.Nil(t, bErr)
+			require.Len(t, response.Data, 3, "the pinned catalog must answer")
+
+			encoded, marshalErr := sonic.ConfigStd.Marshal(response)
+			require.NoError(t, marshalErr, "an unreadable body must not make the catalog answer unencodable")
+			require.Contains(t, string(encoded), "hunyuan-chat")
+			// The body is dropped rather than stringified: the field carries the upstream body only
+			// when that body is JSON, which is what the live path can record.
+			require.Nil(t, response.ExtraFields.RawResponse)
+		})
+	}
 }
 
 // A live listing that fails for any other reason is reported rather than masked by the catalog.
@@ -1185,6 +1282,166 @@ func TestUnauthorizedInvalidationClearsTheStoredAccessToken(t *testing.T) {
 	require.Equal(t, "refresh-1", writes[0].refresh, "the durable credential must survive the clear")
 	require.Equal(t, "access-2", writes[1].access, "the minted rotation is then written")
 	require.Equal(t, "refresh-2", writes[1].refresh)
+}
+
+// TestUnauthorizedRetryReReadsTheRotatedRefreshToken is regression 1.
+//
+// A refresh-only key mints on attempt 1 — the documented config.json shape, and also the shape for an
+// expired stored token or a missing expiry — so the rotation sink persists refresh-2 before the chat
+// call is refused. The invalidation used to rewrite the caller's snapshot (refresh-1) back through
+// the sink and the retry re-minted from it, so the key was left holding a refresh token the upstream
+// had already retired, while the good rotation was destroyed. The retry has to re-read the store.
+func TestUnauthorizedRetryReReadsTheRotatedRefreshToken(t *testing.T) {
+	var mu sync.Mutex
+	var sent []string
+	refreshes := 0
+	chatCalls := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.URL.Path {
+		case "/v2/plugin/auth/token/refresh":
+			refreshes++
+			sent = append(sent, r.Header.Get("X-Refresh-Token"))
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"code":0,"data":{"accessToken":"access-2","refreshToken":"refresh-2","expiresIn":3600}}`))
+		case "/v2/chat/completions":
+			chatCalls++
+			// Both tokens are revoked upstream; only a third mint (which must not happen) would
+			// succeed, so the test observes the retry's credential rather than its outcome.
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"message":"token revoked"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	var sinkMu sync.Mutex
+	type write struct{ access, refresh, expiresAt string }
+	var writes []write
+	// The store is the authority: the sink writes it, the reader reads it back, exactly as
+	// lib.Config does for the transport.
+	var storeMu sync.Mutex
+	storedAccess, storedRefresh := "", "refresh-1"
+	SetCredentialSink(func(provider schemas.ModelProvider, keyID, accessToken, refreshToken, expiresAt string) {
+		sinkMu.Lock()
+		writes = append(writes, write{accessToken, refreshToken, expiresAt})
+		sinkMu.Unlock()
+
+		storeMu.Lock()
+		defer storeMu.Unlock()
+		// Mirrors applyProviderKeyTokens: an empty access token is written through, an empty
+		// refresh token leaves the stored one alone.
+		storedAccess = accessToken
+		if refreshToken != "" {
+			storedRefresh = refreshToken
+		}
+	})
+	SetCredentialReader(func(provider schemas.ModelProvider, keyID string) (schemas.Key, bool) {
+		storeMu.Lock()
+		defer storeMu.Unlock()
+		return schemas.Key{ID: keyID, OAuthKeyConfig: &schemas.OAuthKeyConfig{
+			GrantType:    schemas.OAuthGrantBrowserLogin,
+			TokenURL:     *schemas.NewSecretVar(server.URL + "/v2/plugin/auth/token/refresh"),
+			AccessToken:  schemas.NewSecretVar(storedAccess),
+			RefreshToken: schemas.NewSecretVar(storedRefresh),
+		}}, true
+	})
+	t.Cleanup(func() {
+		SetCredentialSink(nil)
+		SetCredentialReader(nil)
+	})
+
+	p := newTestProvider(t, server.URL)
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	// Refresh token only: no stored access token and no expiry, so attempt 1 mints and rotates.
+	key := schemas.Key{ID: "key-1", OAuthKeyConfig: &schemas.OAuthKeyConfig{
+		GrantType:    schemas.OAuthGrantBrowserLogin,
+		TokenURL:     *schemas.NewSecretVar(server.URL + "/v2/plugin/auth/token/refresh"),
+		RefreshToken: schemas.NewSecretVar("refresh-1"),
+	}}
+
+	_, bErr := p.ChatCompletion(ctx, key, chatRequest())
+	require.NotNil(t, bErr)
+	require.NotNil(t, bErr.StatusCode)
+	require.Equal(t, http.StatusUnauthorized, *bErr.StatusCode)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, []string{"refresh-1", "refresh-2"}, sent,
+		"the retry must mint from the rotation the store already holds, not from the caller's snapshot")
+	require.Equal(t, 2, refreshes, "one mint per attempt: the retry must not need a third")
+	require.Equal(t, 2, chatCalls)
+
+	sinkMu.Lock()
+	defer sinkMu.Unlock()
+	// writes[0] is attempt 1's rotation, writes[1] the invalidation's clear, writes[2] the retry's
+	// own rotation.
+	require.Len(t, writes, 3)
+	require.Equal(t, "", writes[1].access, "the refused access token is cleared")
+	require.Equal(t, "refresh-2", writes[1].refresh,
+		"the clear must carry the store's refresh token, never the caller's retired snapshot")
+
+	storeMu.Lock()
+	defer storeMu.Unlock()
+	require.Equal(t, "refresh-2", storedRefresh, "the invalidation must not write the retired refresh token back")
+	require.Equal(t, "access-2", storedAccess, "the retry's rotation is what the store ends up holding")
+}
+
+// Without a reader, the provider has only its own copy — and a deployment with no reader also has no
+// sink, so nothing could have rotated the credential in the first place. The retry still drops the
+// access token and mints, which is the whole point of the invalidation.
+func TestUnauthorizedRetryWithoutAReaderStillMints(t *testing.T) {
+	var mu sync.Mutex
+	refreshes := 0
+	chatCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.URL.Path {
+		case "/v2/plugin/auth/token/refresh":
+			refreshes++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"code":0,"data":{"accessToken":"access-2","refreshToken":"refresh-2","expiresIn":3600}}`))
+		case "/v2/chat/completions":
+			chatCalls++
+			if r.Header.Get("Authorization") != "Bearer access-2" {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"message":"token revoked"}`))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"hunyuan-chat","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`))
+		}
+	}))
+	defer server.Close()
+
+	SetCredentialSink(nil)
+	SetCredentialReader(nil)
+	t.Cleanup(func() {
+		SetCredentialSink(nil)
+		SetCredentialReader(nil)
+	})
+
+	p := newTestProvider(t, server.URL)
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	key := schemas.Key{ID: "key-1", OAuthKeyConfig: &schemas.OAuthKeyConfig{
+		GrantType:    schemas.OAuthGrantBrowserLogin,
+		TokenURL:     *schemas.NewSecretVar(server.URL + "/v2/plugin/auth/token/refresh"),
+		AccessToken:  schemas.NewSecretVar("access-revoked"),
+		RefreshToken: schemas.NewSecretVar("refresh-1"),
+		ExpiresAt:    time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+	}}
+
+	_, bErr := p.ChatCompletion(ctx, key, chatRequest())
+	require.Nil(t, bErr)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, 1, refreshes)
+	require.Equal(t, 2, chatCalls)
 }
 
 // A pasted key is served as-is and never reaches the token endpoint.

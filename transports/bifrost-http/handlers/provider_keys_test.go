@@ -2428,6 +2428,90 @@ func TestInstallCodeBuddyCredentialSinkPersistsARotation(t *testing.T) {
 	}
 }
 
+// TestInstallCodeBuddyCredentialSinkInstallsAReader pins the read-back half of the wiring, through
+// the real provider and the real config. A refresh-only key mints on attempt 1, so the sink persists
+// refresh-2 before the chat call is refused; the retry must then invalidate and mint from refresh-2.
+// Without the reader the provider retries from the caller's snapshot (refresh-1, already retired),
+// which is the failure this pins.
+func TestInstallCodeBuddyCredentialSinkInstallsAReader(t *testing.T) {
+	SetLogger(&mockLogger{})
+	lib.SetLogger(&mockLogger{})
+	t.Cleanup(func() {
+		codebuddycn.SetCredentialSink(nil)
+		codebuddycn.SetCredentialReader(nil)
+	})
+
+	var mu sync.Mutex
+	var sent []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.URL.Path {
+		case "/v2/plugin/auth/token/refresh":
+			sent = append(sent, r.Header.Get("X-Refresh-Token"))
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"code":0,"data":{"accessToken":"access-2","refreshToken":"refresh-2","expiresIn":3600}}`))
+		default:
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"message":"token revoked"}`))
+		}
+	}))
+	defer server.Close()
+
+	key := schemas.Key{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: &schemas.OAuthKeyConfig{
+		GrantType:    schemas.OAuthGrantBrowserLogin,
+		TokenURL:     *schemas.NewSecretVar(server.URL + "/v2/plugin/auth/token/refresh"),
+		RefreshToken: schemas.NewSecretVar("refresh-1"),
+	}}
+	store := newTokenWriteStore(key)
+	config := &lib.Config{
+		ConfigStore: store,
+		Providers: map[schemas.ModelProvider]configstore.ProviderConfig{
+			schemas.CodeBuddyCN: {Keys: []schemas.Key{key}},
+		},
+	}
+	uninstall := InstallCodeBuddyCredentialSink(config)
+	defer uninstall()
+
+	provider, err := codebuddycn.NewCodeBuddyCNProvider(&schemas.ProviderConfig{
+		NetworkConfig: schemas.NetworkConfig{
+			BaseURL:                        server.URL,
+			AllowPrivateNetwork:            true,
+			DefaultRequestTimeoutInSeconds: 10,
+		},
+	}, &mockLogger{})
+	if err != nil {
+		t.Fatalf("new provider: %v", err)
+	}
+
+	_, bErr := provider.ChatCompletion(schemas.NewBifrostContext(context.Background(), schemas.NoDeadline), key, &schemas.BifrostChatRequest{
+		Provider: schemas.CodeBuddyCN,
+		Model:    "m",
+		Input: []schemas.ChatMessage{{
+			Role:    schemas.ChatMessageRoleUser,
+			Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("hi")},
+		}},
+	})
+	if bErr == nil {
+		t.Fatal("both attempts are refused by this server, so an error is expected")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []string{"refresh-1", "refresh-2"}; len(sent) != 2 || sent[0] != want[0] || sent[1] != want[1] {
+		t.Fatalf("refresh tokens sent = %v, want %v (the retry must read the rotation back from the store)", sent, want)
+	}
+
+	got := storedProviderKey(t, config, "key-1").OAuthKeyConfig
+	if got.RefreshToken.GetValue() != "refresh-2" {
+		t.Fatalf("in-memory refresh token = %q, want refresh-2", got.RefreshToken.GetValue())
+	}
+	store.awaitWrites(t, 3) // attempt 1's rotation, the invalidation's clear, then the retry's rotation
+	if got := store.storedKey(t, "key-1").OAuthKeyConfig; got.RefreshToken.GetValue() != "refresh-2" {
+		t.Fatalf("the store's refresh token = %q, want refresh-2", got.RefreshToken.GetValue())
+	}
+}
+
 // TestRotatedTokenPersistDoesNotBlockTheRequestPath pins the reason UpdateProviderKeyTokens splits
 // the in-memory apply from the store write. The provider invokes the sink while tokencache holds
 // that credential's slot mutex, so a store write awaited there would stall every concurrent request

@@ -26,6 +26,9 @@ export const PROVIDER_KEYWORDS = {
   openrouter: ["openrouter"],
   huggingface: ["huggingface", "hugging face"],
   replicate: ["replicate", "/replicate", "flux", "black-forest-labs"],
+  // Hyphenated, so the partition name itself is the only signal: a row is named
+  // "codebuddy-cn/hunyuan-chat" and its URL is the shared /v1/chat/completions.
+  "codebuddy-cn": ["codebuddy-cn", "codebuddy_cn"],
 };
 
 // filter-collection asks "does this item match provider P?" once per fork, so an
@@ -44,6 +47,10 @@ export const MATCH_ORDER = [
   "bedrock",
   "gemini",
   "anthropic",
+  // Ahead of openai: a cross-cut row's name is "codebuddy-cn/<model>" and no
+  // other provider's keyword appears in it, so this only has to outrank "openai"
+  // for rows that also name an openai model.
+  "codebuddy-cn",
   "openai",
   // Last, so a row that also names an earlier provider keeps its existing owner.
   "groq",

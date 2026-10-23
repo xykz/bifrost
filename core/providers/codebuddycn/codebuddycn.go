@@ -19,6 +19,7 @@
 package codebuddycn
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"maps"
@@ -309,13 +310,13 @@ func (p *CodeBuddyCNProvider) listModelsByKey(ctx *schemas.BifrostContext, key s
 	body, bodyErr := providerUtils.CheckAndDecodeBody(resp)
 
 	if resp.StatusCode() == fasthttp.StatusNotFound {
-		return p.catalogResponse(key, request, latency, body), nil
+		return p.catalogResponse(ctx, key, request, latency, body), nil
 	}
 	if resp.StatusCode() != fasthttp.StatusOK {
 		return nil, providerUtils.SetErrorLatency(parseError(resp), latency)
 	}
 	if bodyErr != nil {
-		return p.catalogResponse(key, request, latency, body), nil
+		return p.catalogResponse(ctx, key, request, latency, body), nil
 	}
 	listing := &openai.OpenAIListModelsResponse{}
 	_, rawResponse, bErr := providerUtils.HandleProviderResponse(
@@ -323,7 +324,7 @@ func (p *CodeBuddyCNProvider) listModelsByKey(ctx *schemas.BifrostContext, key s
 		providerUtils.ShouldSendBackRawResponse(ctx, p.sendBackRawResponse),
 	)
 	if bErr != nil {
-		return p.catalogResponse(key, request, latency, body), nil
+		return p.catalogResponse(ctx, key, request, latency, body), nil
 	}
 
 	response := listing.ToBifrostListModelsResponse(p.GetProviderKey(), key.Models, key.BlacklistedModels, key.Aliases, request.Unfiltered)
@@ -337,16 +338,38 @@ func (p *CodeBuddyCNProvider) listModelsByKey(ctx *schemas.BifrostContext, key s
 // invisible in the logs that show how long the listing took and what the upstream actually sent,
 // which is precisely the question asked when a deployment's model picker disagrees with the
 // catalog.
-func (p *CodeBuddyCNProvider) catalogResponse(key schemas.Key, request *schemas.BifrostListModelsRequest, latency time.Duration, body []byte) *schemas.BifrostListModelsResponse {
+//
+// The raw body goes through the same gate and the same compaction as the live listing
+// (ShouldSendBackRawResponse + compacted JSON), so the two branches write the same value for the
+// same upstream body, including a per-request x-bf-send-back-raw-response override.
+func (p *CodeBuddyCNProvider) catalogResponse(ctx *schemas.BifrostContext, key schemas.Key, request *schemas.BifrostListModelsRequest, latency time.Duration, body []byte) *schemas.BifrostListModelsResponse {
 	unfiltered := request != nil && request.Unfiltered
 	response := catalogListModelsResponse(key.Models, key.BlacklistedModels, key.Aliases, unfiltered)
 	response.ExtraFields.Latency = latency.Milliseconds()
-	if len(body) > 0 && p.sendBackRawResponse {
-		// json.RawMessage, not []byte: a plain byte slice marshals as base64, which would put a
-		// different value on the wire than the live-listing path writes for the same field.
-		response.ExtraFields.RawResponse = json.RawMessage(body)
-	}
+	response.ExtraFields.RawResponse = catalogRawResponse(ctx, p.sendBackRawResponse, body)
 	return response
+}
+
+// catalogRawResponse returns the body as the live listing path would record it, or nil when it must
+// not be recorded at all.
+//
+// It is deliberately nil for anything that is not valid JSON. json.RawMessage is validated when the
+// response is marshalled, so a RawMessage holding an HTML interstitial or a plain-text maintenance
+// page makes the whole catalog answer fail to encode — a 500 for exactly the case the catalog
+// exists to answer. Dropping the unreadable body keeps the models visible; the status code and the
+// recorded latency still say the upstream sent something the provider could not use.
+func catalogRawResponse(ctx *schemas.BifrostContext, sendBackRawResponse bool, body []byte) interface{} {
+	if len(body) == 0 || !providerUtils.ShouldSendBackRawResponse(ctx, sendBackRawResponse) {
+		return nil
+	}
+	// Compaction is the validity test as well: schemas.Compact rejects malformed JSON, and the live
+	// path stores exactly this compacted form. A body that fails it is one the live path would have
+	// recorded as a decode error, never as raw bytes.
+	var compact bytes.Buffer
+	if err := schemas.Compact(&compact, body); err != nil {
+		return nil
+	}
+	return json.RawMessage(compact.Bytes())
 }
 
 // ChatCompletion performs a chat completion request to the CodeBuddy API. The caller's stream
@@ -401,9 +424,17 @@ func (p *CodeBuddyCNProvider) chatCompletion(ctx *schemas.BifrostContext, key sc
 // The fast path in resolveKey is what makes this necessary: it serves the stored access token for
 // as long as the expiry says it is fresh, and nothing told that path the upstream had revoked the
 // token early. Both places that can keep serving it are cleared — the token cache, and the stored
-// access token the config holds — so the retry mints from the refresh token. The stored token is
-// cleared through the credential sink rather than a second writer, and before the mint, so the
-// mint's own rotation is what ends up persisted.
+// access token the config holds — so the retry mints from the refresh token.
+//
+// The retry key is re-read from the persistence layer after the clear, never derived from the
+// caller's snapshot. attempt 1 may itself have minted: a refresh-only key, an expired stored token
+// or a missing expiry all mint before sending, and that mint rotates the refresh token and persists
+// it. The caller's copy still carries the *previous* refresh token, which upstream has already
+// retired — retrying from it would fail the mint and destroy a rotation that had already landed. The
+// store is the only place the newest token exists, so the retry reads it from there.
+//
+// The clear is likewise access-token-only: writing the snapshot's refresh token back would overwrite
+// the rotation in the store with the retired one. See invalidateBrowserLoginCredential.
 //
 // Exactly one retry is possible: the caller makes this decision once per request, and a second 401
 // is returned with AllowFallbacks false, which is the spec's permanent-credential ruling.
@@ -425,15 +456,33 @@ func (p *CodeBuddyCNProvider) retryOnUnauthorized(key schemas.Key, bErr *schemas
 		return key, false
 	}
 	p.invalidateBrowserLoginCredential(key)
-	// The cache was just invalidated, so the fast path would still read the stored token off this
-	// copy of the key. Dropping it from the retry's key makes the mint unconditional, which is the
+	// Re-read after the clear, not before: the point is the credential as it stands now, with the
+	// refused access token gone and whatever refresh token the store holds. Dropping the access
+	// token and expiry from the retry's key makes the mint unconditional either way, which is the
 	// point of the invalidate: the credential that was refused must not be offered again.
-	retry := key
-	cfg := *key.OAuthKeyConfig
+	retry := p.currentKey(key)
+	cfg := *retry.OAuthKeyConfig
 	cfg.AccessToken = nil
 	cfg.ExpiresAt = ""
 	retry.OAuthKeyConfig = &cfg
 	return retry, true
+}
+
+// currentKey returns the key as the persistence layer holds it now, falling back to the caller's
+// copy when no reader is installed, it no longer knows the key, or the row has no refresh token to
+// mint from. The fallback is safe: it is the same credential the request was already using, and only
+// the refresh token can be stale — a deployment with no reader (the Go SDK) also has no sink, so
+// nothing rotated it in the first place.
+func (p *CodeBuddyCNProvider) currentKey(key schemas.Key) schemas.Key {
+	reader := currentCredentialReader()
+	if reader == nil || key.ID == "" {
+		return key
+	}
+	current, ok := reader(p.GetProviderKey(), key.ID)
+	if !ok || current.OAuthKeyConfig == nil || current.OAuthKeyConfig.RefreshToken.GetValue() == "" {
+		return key
+	}
+	return current
 }
 
 // invalidateBrowserLoginCredential drops the cached access token for a browser_login key and asks
@@ -443,6 +492,12 @@ func (p *CodeBuddyCNProvider) retryOnUnauthorized(key schemas.Key, bErr *schemas
 //
 // The sink is reused rather than a second write path: it is already the one owner of "persist this
 // credential", including the store write and the in-memory update that the next request reads.
+//
+// Only the access token is cleared. The refresh token is passed through as whatever the store holds
+// at this moment, never as the caller's snapshot: attempt 1 may have rotated it, and rewriting the
+// retired value would destroy the rotation and leave the key dead. When no reader is installed the
+// snapshot is the only value there is, and it is also the store's value — nothing could have rotated
+// it — so passing it is correct there.
 func (p *CodeBuddyCNProvider) invalidateBrowserLoginCredential(key schemas.Key) {
 	tokencache.InvalidateForConfig(p.tokens, key.OAuthKeyConfig)
 	if key.OAuthKeyConfig == nil {
@@ -452,10 +507,16 @@ func (p *CodeBuddyCNProvider) invalidateBrowserLoginCredential(key schemas.Key) 
 	if sink == nil {
 		return
 	}
+	refreshToken := key.OAuthKeyConfig.RefreshToken.GetValue()
+	// Only adopt the store's value when it actually carries one: an empty field would otherwise be
+	// written back as an empty refresh token, which is a worse outcome than a stale one.
+	if stored := p.currentKey(key); stored.OAuthKeyConfig != nil && stored.OAuthKeyConfig.RefreshToken.GetValue() != "" {
+		refreshToken = stored.OAuthKeyConfig.RefreshToken.GetValue()
+	}
 	// An empty access token and an empty expiry: the refresh token stays, and the empty expiry asks
 	// applyProviderKeyTokens to leave the stored value alone. What is being written is the absence
 	// of a token, not a token.
-	sink(p.GetProviderKey(), key.ID, "", key.OAuthKeyConfig.RefreshToken.GetValue(), "")
+	sink(p.GetProviderKey(), key.ID, "", refreshToken, "")
 }
 
 // ChatCompletionStream performs a streaming chat completion request to the CodeBuddy API.

@@ -44,6 +44,16 @@ func InstallCodeBuddyCredentialSink(config *lib.Config) func() {
 	codebuddycn.SetCredentialSink(func(provider schemas.ModelProvider, keyID, accessToken, refreshToken, expiresAt string) {
 		persistRotatedCredential(config, provider, keyID, accessToken, refreshToken, expiresAt)
 	})
+	// The read-back half exists because a rotation lands while the request that triggered it is
+	// still in flight: after a mint, the caller's key snapshot carries the previous refresh token.
+	// A 401 has to invalidate and retry from the row the sink just wrote, not from that snapshot.
+	codebuddycn.SetCredentialReader(func(provider schemas.ModelProvider, keyID string) (schemas.Key, bool) {
+		key, err := config.GetProviderKeyRaw(provider, keyID)
+		if err != nil || key == nil {
+			return schemas.Key{}, false
+		}
+		return *key, true
+	})
 	return func() {
 		// Ownership-checked: a later install owns the sink now, and clearing it would break that
 		// server rather than this one. Compare-then-clear is safe against a concurrent install
@@ -52,6 +62,7 @@ func InstallCodeBuddyCredentialSink(config *lib.Config) func() {
 			return
 		}
 		codebuddycn.SetCredentialSink(nil)
+		codebuddycn.SetCredentialReader(nil)
 	}
 }
 

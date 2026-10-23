@@ -162,6 +162,10 @@ const PROVIDER_KEYWORDS = {
   replicate: ["replicate", "/replicate", "flux", "black-forest-labs"],
   runware: ["runware", "runware/"],
   typesafe: ["typesafe", "/typesafe", "jev-"],
+  // Hyphenated name; the row is named "codebuddy-cn/<model>" over the shared
+  // /v1/chat/completions URL, so the partition name is the whole signal. Kept in
+  // step with lib/provider-attribution.mjs, which owns the sequential split.
+  "codebuddy-cn": ["codebuddy-cn", "codebuddy_cn"],
 };
 
 // Haystack = item JSON + ancestor folder names. Folder names encode the harness
