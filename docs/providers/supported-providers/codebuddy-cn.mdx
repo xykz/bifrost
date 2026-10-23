@@ -110,8 +110,9 @@ With a browser-login bundle:
 
 `refresh_token` is the durable credential and is required for `browser_login`; `access_token` and
 `expires_at` are optional and are refreshed before use when absent. Leave `value` out when
-`oauth_key_config` is set — a non-empty `value` always wins, and a pasted key is sent as
-`X-API-Key` instead of a bearer.
+`oauth_key_config` is set: `resolveKey` would send the pasted value as `X-API-Key` and ignore the
+bundle, and the management API rejects a key that carries both rather than storing one the other
+silently shadows.
 
 </Tab>
 <Tab title="API">
@@ -120,6 +121,40 @@ Refer to the API documentation for [Provider Keys Management](https://docs.getbi
 The login endpoints are documented in the OpenAPI reference under **Providers**:
 `POST /api/providers/{provider}/codebuddy-cn/login` and
 `GET /api/providers/{provider}/codebuddy-cn/login/{flow_id}`.
+
+</Tab>
+<Tab title="Go SDK">
+
+```go
+case schemas.CodeBuddyCN:
+    return []schemas.Key{{
+        Name:   "codebuddy-cn-key-1",
+        Value:  *schemas.NewSecretVar("env.CODEBUDDY_CN_API_KEY"),
+        Models: []string{"*"},
+        Weight: 1.0,
+    }}, nil
+```
+
+A browser-login key omits `Value` and carries the durable `refresh_token` instead; `TokenURL` is
+the refresh endpoint derived from the base URL:
+
+```go
+case schemas.CodeBuddyCN:
+    return []schemas.Key{{
+        Name:   "codebuddy-cn-login",
+        Models: []string{"*"},
+        Weight: 1.0,
+        OAuthKeyConfig: &schemas.OAuthKeyConfig{
+            GrantType:    schemas.OAuthGrantBrowserLogin,
+            TokenURL:     *schemas.NewSecretVar("https://copilot.tencent.com/v2/plugin/auth/token/refresh"),
+            RefreshToken: schemas.NewSecretVar("env.CODEBUDDY_CN_REFRESH_TOKEN"),
+        },
+    }}, nil
+```
+
+`AccessToken` and `ExpiresAt` are optional. The Go SDK has no process-wide credential sink, so a
+rotation it sees while minting is discarded; a long-running SDK process that needs to keep a
+rotating refresh token must persist it itself.
 
 </Tab>
 </Tabs>
@@ -135,9 +170,12 @@ A CodeBuddy CN key carries exactly one credential. The mode is selected by what 
 | Pasted API key | `value` (supports `env.` and vault references) | `X-API-Key: <key>` |
 | OAuth browser login | `oauth_key_config` with `grant_type: browser_login` | `Authorization: Bearer <access token>` |
 
-The two are mutually exclusive. A non-empty `value` always wins over `oauth_key_config`, and the
-UI clears one when you switch to the other. Sending a pasted key as a bearer is rejected by
-CodeBuddy's front end before credential validation runs, which is why the header differs by mode.
+The two are mutually exclusive, and the management API enforces it: a key carrying both a
+non-empty `value` and an `oauth_key_config` is rejected with
+`a codebuddy-cn key takes either a pasted api key or an oauth login, not both`, so there is no
+"one wins" state to rely on. The UI clears one when you switch to the other. Sending a pasted key
+as a bearer is rejected by CodeBuddy's front end before credential validation runs, which is why
+the header differs by mode.
 
 ### Browser login
 
@@ -150,9 +188,9 @@ sign-in page, polls until the browser finishes, then stores the token pair on th
 reads **Re-authenticate** once a pair is stored.
 
 The same flow is available over the management API. Both endpoints require an authenticated admin
-session, and neither is reachable without one: on a deployment whose dashboard authentication is
-disabled or unconfigured they refuse with `403` instead of minting a credential for anyone on the
-network.
+session: a session-less request on a deployment with dashboard authentication enabled is rejected
+with `401`, and on a deployment whose dashboard authentication is disabled or unconfigured the
+handler refuses with `403` instead of minting a credential for anyone on the network.
 
 ```bash
 # 1. Start the flow. The response carries the URL to open and its deadline.
@@ -206,16 +244,23 @@ proxy or a private deployment stores that host's refresh URL on the key, rather 
 gateway's.
 
 A refresh that returns `401`, or the gateway's `12153` ("refresh token invalid") inside an
-HTTP-200 body, is a **permanent** credential fault. Bifrost does not retry it and does not fall
-back to another provider: the key needs a re-login.
+HTTP-200 body, is a **permanent** credential fault. The key that hit it is dropped for the rest of
+that request, so it is not retried there, and `AllowFallbacks` is false so the request is never
+drained onto another provider; if no other key on the provider can serve it, the client gets the
+`401`. The failure is cached only for a backoff window, though: `tokencache` records it as
+permanent with `DefaultPermanentBackoff` (2s, doubling, capped at 60s), and once that window
+elapses the next request retries the refresh. The classification only bounds how often the token
+endpoint is hit; it does not stop the retries, so expect a repeating `401` from the token endpoint
+in your metrics until the key is re-authenticated. Nothing recovers on its own.
 
 ### Re-authenticating a dead refresh token
 
 When the refresh token dies, requests on that key fail with a `401` whose message says the refresh
 token is invalid. Open the provider's key in **Models** > **Model Providers** and click
 **Re-authenticate** under **OAuth login**; the fresh pair replaces the dead one in the same write.
-The same replacement can be sent through the key update endpoint, but it has to carry
-`access_token`, `refresh_token` and `expires_at` together — the sign-in is what produces all three.
+The same replacement can be sent through the key update endpoint: `refresh_token` is the only
+required field, `access_token` is optional, and an absent `expires_at` is stored empty, which the
+refresh logic reads as "refresh on first use".
 
 <Warning>
 **Deployments without a config store lose a rotated refresh token on restart.** With
@@ -345,8 +390,8 @@ the upstream list changes.
 
 <Accordion title="Dead Refresh Token Is Permanent">
 **Severity**: Medium
-**Behavior**: A `401` from the refresh endpoint, or code `12153` in an HTTP-200 body, is treated as a permanent credential fault
-**Impact**: The request fails instead of being retried or falling back, and the key must be re-authenticated; this is deliberate, since a fallback would hide a dead key behind traffic billed elsewhere
+**Behavior**: A `401` from the refresh endpoint, or code `12153` in an HTTP-200 body, is treated as a permanent credential fault and pins the error to `401` with fallbacks blocked
+**Impact**: The key is dropped for the rest of that request and the request does not fall back to another provider, so it fails unless another key on codebuddy-cn can serve it; the key must be re-authenticated. Later traffic retries the refresh on a capped 2s→60s backoff, so the failure repeats in the token-endpoint metrics rather than going quiet. Blocking the fallback is deliberate: it would otherwise hide a dead key behind traffic billed elsewhere
 **Code**: `parseError` in `core/providers/codebuddycn/errors.go`; `deadRefreshTokenError` in `core/providers/utils/tokencache/browserlogin.go`
 </Accordion>
 
@@ -359,7 +404,7 @@ the upstream list changes.
 
 <Accordion title="Login Requires an Admin Session">
 **Severity**: Medium
-**Behavior**: Both login handlers refuse a deployment whose dashboard authentication is disabled or unconfigured with `403`, and the management middleware rejects a request that carries no admin session; the login is never an unauthenticated endpoint
+**Behavior**: A session-less request on a deployment with dashboard authentication enabled is rejected with `401`; on a deployment whose dashboard authentication is disabled or unconfigured both handlers refuse with `403`, so the login is never an unauthenticated endpoint
 **Impact**: Browser login is an operator action; it cannot be used as a per-end-user sign-in, and one credential set per key is shared by all gateway traffic
 **Code**: `startCodeBuddyLogin` and `pollCodeBuddyLogin` in `transports/bifrost-http/handlers/codebuddylogin.go`
 </Accordion>
@@ -368,5 +413,5 @@ the upstream list changes.
 **Severity**: Low
 **Behavior**: `X-Product`, `X-IDE-Type`, `X-IDE-Name` and `X-IDE-Version` are sent on every inference call
 **Impact**: The values come from Tencent's CLI rather than a published contract and may need updating when CodeBuddy ships a release that changes them. They take priority over `network_config.extra_headers`; a per-request context header is the only way to send a different value
-**Code**: `mergeExtraHeaders` and `editorHeaders` in `core/providers/codebuddycn/headers.go`
+**Code**: `mergeExtraHeaders` in `core/providers/codebuddycn/codebuddycn.go`; `editorHeaders` in `core/providers/codebuddycn/headers.go`
 </Accordion>

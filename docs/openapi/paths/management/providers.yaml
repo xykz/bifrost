@@ -553,9 +553,10 @@ codebuddy-login-start:
 
       The login is an **admin** action, not a per-end-user sign-in: the resulting token pair is
       stored on a key and shared by every request that key serves. Both this endpoint and its
-      poll require an authenticated admin session; on a deployment whose dashboard
-      authentication is disabled or unconfigured they refuse with `403` rather than minting a
-      credential for anyone on the network.
+      poll require an authenticated admin session: a session-less request on a deployment with
+      dashboard authentication enabled is rejected with `401`, and on a deployment whose
+      dashboard authentication is disabled or unconfigured the handler refuses with `403` rather
+      than minting a credential for anyone on the network.
 
       The request body is ignored. The upstream host comes only from the provider's
       `network_config.base_url`, falling back to `https://copilot.tencent.com`, so this endpoint
@@ -585,8 +586,10 @@ codebuddy-login-start:
           application/json:
             schema:
               $ref: '../../schemas/inference/common.yaml#/BifrostError'
+      '401':
+        $ref: '../../openapi.yaml#/components/responses/Unauthorized'
       '403':
-        description: No authenticated admin session (dashboard authentication disabled or unconfigured)
+        description: Dashboard authentication is disabled or unconfigured, so the handler refuses a login it cannot attribute to an admin
         content:
           application/json:
             schema:
@@ -628,7 +631,10 @@ codebuddy-login-poll:
       (that is `flow_expires_at` on the start response). A flow that expires before the browser
       finishes, or one belonging to a different provider, answers `404`.
 
-      Requires an authenticated admin session; without one this returns `403`.
+      Requires an authenticated admin session: a session-less request on a deployment with
+      dashboard authentication enabled is rejected with `401`. On a deployment whose dashboard
+      authentication is disabled or unconfigured the handler refuses with `403`, because a login
+      it cannot attribute to an admin is not run at all.
     tags:
       - Providers
     parameters:
@@ -660,8 +666,10 @@ codebuddy-login-poll:
           application/json:
             schema:
               $ref: '../../schemas/inference/common.yaml#/BifrostError'
+      '401':
+        $ref: '../../openapi.yaml#/components/responses/Unauthorized'
       '403':
-        description: No authenticated admin session (dashboard authentication disabled or unconfigured)
+        description: Dashboard authentication is disabled or unconfigured, so the handler refuses a login it cannot attribute to an admin
         content:
           application/json:
             schema:
