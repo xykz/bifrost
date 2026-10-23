@@ -959,6 +959,12 @@ def test_oauth_key_config_contract_matches_server_validation():
         ("assertion_lifetime_seconds 0 means the default", {"grant_type": "jwt_bearer", "token_url": token_url, "private_key": "pem", "issuer": "i", "audience": "a", "assertion_lifetime_seconds": 0}, True),
         ("a negative assertion lifetime", {"grant_type": "jwt_bearer", "token_url": token_url, "private_key": "pem", "issuer": "i", "audience": "a", "assertion_lifetime_seconds": -1}, False),
         ("an assertion lifetime above an hour", {"grant_type": "jwt_bearer", "token_url": token_url, "private_key": "pem", "issuer": "i", "audience": "a", "assertion_lifetime_seconds": 3601}, False),
+        # browser_login: Validate requires refresh_token and treats expires_at as optional, so the
+        # published spec has to declare the grant and all three fields with the same requirements.
+        ("browser_login with the full bundle", {"grant_type": "browser_login", "token_url": token_url, "access_token": "a", "refresh_token": "r", "expires_at": "2026-10-22T12:00:00Z"}, True),
+        ("browser_login without the access token", {"grant_type": "browser_login", "token_url": token_url, "refresh_token": "r"}, True),
+        ("browser_login without refresh_token", {"grant_type": "browser_login", "token_url": token_url, "access_token": "a"}, False),
+        ("browser_login without any credential", {"grant_type": "browser_login", "token_url": token_url}, False),
     ]
     problems = [
         f"{name}: OpenAPI says {'valid' if validator.is_valid(block) else 'invalid'}, server says {'valid' if want else 'invalid'}"

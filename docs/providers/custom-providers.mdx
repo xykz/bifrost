@@ -263,12 +263,13 @@ Custom providers can be built on these supported providers:
 
 A custom provider on the `openai` base normally carries a static API key in each key's `value`. Upstreams that sit behind an identity provider and issue short-lived access tokens can instead be given an `oauth_key_config` on the key: leave `value` empty and Bifrost obtains the token from the token endpoint, sends it as the bearer, caches it per credential, collapses concurrent requests onto one mint, and refreshes it a minute before it expires. A rejected credential is backed off rather than retried on every request. The same machinery serves Databricks OAuth M2M; it applies to the standard `openai` provider too.
 
-Two grants are supported:
+Three grants are supported:
 
 - **`client_credentials`** (RFC 6749 §4.4): a client ID and secret, sent as HTTP Basic auth by default or as form fields with `auth_style: "body"`.
 - **`jwt_bearer`** (RFC 7523): Bifrost signs a JWT assertion (`iss`, `sub`, `aud`, `iat`, `nbf`, `exp`, `jti`) with your RSA or EC private key and exchanges it for a token.
+- **`browser_login`**: an interactive sign-in. The durable credential is a refresh token, and Bifrost mints the short-lived access token it sends from that. `codebuddy-cn` is the built-in provider that uses this grant.
 
-A non-empty `value` always wins, so a key can carry both while you migrate. `oauth_key_config` is only accepted on `openai` and on custom providers whose base is `openai`; elsewhere it is refused at configuration time rather than silently ignored.
+A non-empty `value` always wins, so a key can carry both while you migrate. `oauth_key_config` is only accepted on `openai`, on `codebuddy-cn`, and on custom providers whose base is `openai`; elsewhere it is refused at configuration time rather than silently ignored.
 
 <Tabs group="custom-provider-oauth">
 
@@ -362,11 +363,14 @@ curl --location 'http://localhost:8080/api/providers/acme-llm/keys' \
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `grant_type` | ✅ | `client_credentials` or `jwt_bearer`. |
+| `grant_type` | ✅ | `client_credentials`, `jwt_bearer` or `browser_login`. |
 | `token_url` | ✅ | The token endpoint. Must be `https` (plain `http` is accepted for loopback hosts only) and must not carry userinfo, a query or a fragment, since the URL is shown in plain text when the key is read back. Supports `env.` references. |
 | `client_id` | client credentials | Client ID. |
 | `client_secret` | client credentials | Client secret. |
 | `auth_style` | | `header` (HTTP Basic, default) or `body` (form fields) for the client credentials. |
+| `access_token` | browser login | The short-lived bearer. Optional: it is refreshed before use, and on first use when absent. |
+| `refresh_token` | browser login | The durable credential that mints access tokens. Required for the `browser_login` grant. |
+| `expires_at` | | Browser login only: the RFC3339 expiry of `access_token`. Omit it to refresh on first use. |
 | `private_key` | JWT bearer | RSA or EC private key in PEM form. PKCS#1, SEC 1 and PKCS#8 all work; a PEM pasted with literal `\n` is repaired. |
 | `issuer` | JWT bearer | The `iss` claim, usually the client or service account ID. |
 | `subject` | | The `sub` claim. Defaults to `issuer`. |

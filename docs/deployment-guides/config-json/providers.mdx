@@ -46,7 +46,7 @@ Every key object supports these fields:
 | `enabled` | boolean | Set to `false` to keep the key configured but skip it during key selection. Same as the **Enabled** toggle in the UI. New keys default to `true`; omitting it on an existing key keeps the stored value (for example a UI toggle) |
 | `aliases` | object | Map logical name → actual model name for this key |
 | `use_for_batch_api` | boolean | Mark key as eligible for batch API calls |
-| `oauth_key_config` | object | Mint the bearer from an OAuth token endpoint instead of carrying a static `value`. `openai` and custom providers on the `openai` base only. See below |
+| `oauth_key_config` | object | Mint the bearer from an OAuth token endpoint instead of carrying a static `value`. `openai`, `codebuddy-cn`, and custom providers on the `openai` base only. See below |
 
 ### OAuth-minted keys (`oauth_key_config`)
 
@@ -54,10 +54,13 @@ Leave `value` empty and set `oauth_key_config` to have Bifrost request the acces
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `grant_type` | string | `client_credentials` or `jwt_bearer` (required) |
+| `grant_type` | string | `client_credentials`, `jwt_bearer` or `browser_login` (required) |
 | `token_url` | string | Token endpoint, `https` (required; `env.` reference allowed). Plain `http` only for loopback hosts; no userinfo, query or fragment |
 | `client_id`, `client_secret` | string | Client credentials for `client_credentials` |
 | `auth_style` | string | `header` (HTTP Basic, default) or `body` |
+| `access_token` | string | `browser_login` short-lived bearer; refreshed before use, and on first use when absent |
+| `refresh_token` | string | `browser_login` durable credential that mints access tokens (required for that grant) |
+| `expires_at` | string | `browser_login` RFC3339 expiry of `access_token`; omit to refresh on first use |
 | `private_key` | string | RSA or EC PEM for `jwt_bearer` |
 | `issuer`, `subject`, `audience`, `key_id` | string | Assertion claims and `kid` for `jwt_bearer`; `audience` is an optional form parameter for `client_credentials` |
 | `signing_algorithm` | string | `RS256` (default), `RS384`, `RS512`, `PS256`, `PS384`, `PS512`, `ES256`, `ES384`, `ES512` |

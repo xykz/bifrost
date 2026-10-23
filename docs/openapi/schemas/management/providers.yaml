@@ -252,8 +252,8 @@ OAuthKeyConfig:
   properties:
     grant_type:
       type: string
-      enum: [client_credentials, jwt_bearer]
-      description: client_credentials (RFC 6749 §4.4) or jwt_bearer (RFC 7523, Bifrost signs an assertion with private_key)
+      enum: [client_credentials, jwt_bearer, browser_login]
+      description: client_credentials (RFC 6749 §4.4), jwt_bearer (RFC 7523, Bifrost signs an assertion with private_key) or browser_login (an interactive sign-in whose durable credential is a refresh token; codebuddy-cn uses this)
     token_url:
       $ref: '../../schemas/management/common.yaml#/EnvVar'
       description: Token endpoint, absolute https URL (plain http is accepted for loopback hosts only). Must not carry userinfo, a query or a fragment; send extra parameters through extra_params
@@ -294,6 +294,15 @@ OAuthKeyConfig:
       enum: [header, body]
       default: header
       description: client_credentials credential placement (HTTP Basic header or form body)
+    access_token:
+      $ref: '../../schemas/management/common.yaml#/EnvVar'
+      description: browser_login short-lived bearer, refreshed before use (redacted in responses)
+    refresh_token:
+      $ref: '../../schemas/management/common.yaml#/EnvVar'
+      description: browser_login durable credential that mints access tokens (redacted in responses)
+    expires_at:
+      type: string
+      description: browser_login RFC3339 expiry; omit to refresh on first use
     extra_params:
       type: object
       additionalProperties:
@@ -329,6 +338,14 @@ OAuthKeyConfig:
           audience:
             minLength: 1
         description: jwt_bearer needs the signing key plus the non-empty iss and aud claims
+    - if:
+        required: [grant_type]
+        properties:
+          grant_type:
+            const: browser_login
+      then:
+        required: [refresh_token]
+        description: browser_login needs the durable refresh token; expires_at stays optional (empty means refresh on first use)
 
 Key:
   type: object

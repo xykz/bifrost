@@ -729,6 +729,9 @@
         },
         "github-copilot": {
           "$ref": "#/$defs/provider_with_github_copilot_config"
+        },
+        "codebuddy-cn": {
+          "$ref": "#/$defs/provider"
         }
       },
       "additionalProperties": true
@@ -6826,9 +6829,10 @@
               "type": "string",
               "enum": [
                 "client_credentials",
-                "jwt_bearer"
+                "jwt_bearer",
+                "browser_login"
               ],
-              "description": "client_credentials (RFC 6749 §4.4) or jwt_bearer (RFC 7523: Bifrost signs an assertion with private_key)."
+              "description": "client_credentials (RFC 6749 §4.4), jwt_bearer (RFC 7523: Bifrost signs an assertion with private_key) or browser_login (an interactive sign-in whose durable credential is a refresh token; codebuddy-cn uses this)."
             },
             "token_url": {
               "type": "string",
@@ -6899,6 +6903,20 @@
               "default": "header",
               "description": "client_credentials: send the client credentials as HTTP Basic auth (header) or as form fields (body)"
             },
+            "access_token": {
+              "type": "string",
+              "minLength": 1,
+              "description": "browser_login: short-lived bearer, refreshed before use"
+            },
+            "refresh_token": {
+              "type": "string",
+              "minLength": 1,
+              "description": "browser_login: durable credential that mints access tokens"
+            },
+            "expires_at": {
+              "type": "string",
+              "description": "browser_login: RFC3339 expiry; omit to refresh on first use"
+            },
             "extra_params": {
               "type": "object",
               "additionalProperties": {
@@ -6953,6 +6971,20 @@
                     "minLength": 1
                   }
                 }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "grant_type": {
+                    "const": "browser_login"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "refresh_token"
+                ]
               }
             }
           ],
@@ -12790,6 +12822,7 @@
             "bedrock",
             "bedrock_mantle",
             "cohere",
+            "codebuddy-cn",
             "vertex",
             "mistral",
             "ollama",

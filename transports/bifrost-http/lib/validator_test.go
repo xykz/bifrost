@@ -3755,6 +3755,11 @@ func TestSchemaOAuthKeyConfig(t *testing.T) {
 		{"alongside a value", customProvider(`"name": "k", "value": "sk", "models": ["*"], "weight": 1.0, ` + cc)},
 		// OAuthKeyConfig.Validate treats 0 as "use the default lifetime", so the schema must too.
 		{"zero assertion lifetime means the default", customProvider(`"name": "k", "models": ["*"], "weight": 1.0, "oauth_key_config": {"grant_type": "jwt_bearer", "token_url": "https://idp/token", "private_key": "pem", "issuer": "i", "audience": "a", "assertion_lifetime_seconds": 0}`)},
+		// browser_login needs only its refresh token; the other two grants' required fields do not apply.
+		{"browser_login", customProvider(`"name": "k", "models": ["*"], "weight": 1.0, "oauth_key_config": {"grant_type": "browser_login", "token_url": "https://copilot.tencent.com/v2/plugin/auth/token/refresh", "refresh_token": "env.CODEBUDDY_REFRESH_TOKEN"}`)},
+		// expires_at is optional at the schema level: an empty value means "refresh on first use",
+		// which OAuthKeyConfig.Validate allows.
+		{"browser_login with the full bundle", customProvider(`"name": "k", "models": ["*"], "weight": 1.0, "oauth_key_config": {"grant_type": "browser_login", "token_url": "https://copilot.tencent.com/v2/plugin/auth/token/refresh", "access_token": "env.CODEBUDDY_ACCESS_TOKEN", "refresh_token": "env.CODEBUDDY_REFRESH_TOKEN", "expires_at": "2026-10-22T12:00:00Z"}`)},
 	}
 	for _, tt := range valid {
 		t.Run("valid "+tt.name, func(t *testing.T) {
@@ -3772,7 +3777,12 @@ func TestSchemaOAuthKeyConfig(t *testing.T) {
 		{"jwt_bearer without issuer", customProvider(`"name": "k", "models": ["*"], "weight": 1.0, "oauth_key_config": {"grant_type": "jwt_bearer", "token_url": "https://idp/token", "private_key": "pem", "audience": "a"}`)},
 		{"unknown grant", customProvider(`"name": "k", "models": ["*"], "weight": 1.0, "oauth_key_config": {"grant_type": "password", "token_url": "https://idp/token"}`)},
 		{"symmetric algorithm", customProvider(`"name": "k", "models": ["*"], "weight": 1.0, "oauth_key_config": {"grant_type": "jwt_bearer", "token_url": "https://idp/token", "private_key": "pem", "issuer": "i", "audience": "a", "signing_algorithm": "HS256"}`)},
-		{"unknown field", customProvider(`"name": "k", "models": ["*"], "weight": 1.0, "oauth_key_config": {"grant_type": "client_credentials", "token_url": "https://idp/token", "client_id": "id", "client_secret": "s", "refresh_token": "x"}`)},
+		// refresh_token used to be the unknown-field probe here. It is a legitimate
+		// browser_login field now, so the probe moved to a name the block does not declare.
+		{"unknown field", customProvider(`"name": "k", "models": ["*"], "weight": 1.0, "oauth_key_config": {"grant_type": "client_credentials", "token_url": "https://idp/token", "client_id": "id", "client_secret": "s", "not_a_field": "x"}`)},
+		// browser_login stores a refresh token and mints the bearer from it, so it needs its
+		// own credential and none of the two server-to-server grants' fields.
+		{"browser_login without refresh token", customProvider(`"name": "k", "models": ["*"], "weight": 1.0, "oauth_key_config": {"grant_type": "browser_login", "token_url": "https://copilot.tencent.com/v2/plugin/auth/token/refresh", "access_token": "env.A", "expires_at": "2026-10-22T12:00:00Z"}`)},
 		// Validate rejects a blank literal for every per-grant credential, so presence alone is
 		// not enough: an empty string must fail the schema the same way a missing field does.
 		{"blank client_id", customProvider(`"name": "k", "models": ["*"], "weight": 1.0, "oauth_key_config": {"grant_type": "client_credentials", "token_url": "https://idp/token", "client_id": "", "client_secret": "s"}`)},
@@ -3789,6 +3799,124 @@ func TestSchemaOAuthKeyConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestSchemaCodeBuddyCNProviderAccepted pins that config.json accepts codebuddy-cn as a
+// provider key. The provider is in schemas.StandardProviders and core/bifrost.go constructs
+// it, so a config file naming it must validate instead of being rejected as an unknown key.
+// The schema's providers map sets additionalProperties:true, so what makes this meaningful is
+// that the codebuddy-cn entry resolves to the plain provider shape, which is what this pins.
+func TestSchemaCodeBuddyCNProviderAccepted(t *testing.T) {
+	compiled := compileSchema(t)
+
+	cfg := `{
+		"providers": {
+			"codebuddy-cn": {
+				"keys": [
+					{
+						"name": "default",
+						"value": "env.CODEBUDDY_CN_API_KEY",
+						"weight": 1.0,
+						"models": ["*"]
+					}
+				]
+			}
+		}
+	}`
+	if err := validateConfig(t, compiled, cfg); err != nil {
+		t.Fatalf("config.json must accept codebuddy-cn as a provider key: %v", err)
+	}
+
+	t.Run("declared next to github-copilot with the plain provider shape", func(t *testing.T) {
+		schema := loadSchema(t)
+		entry, found := navigateJSON(schema, "properties", "providers", "properties", "codebuddy-cn")
+		if !found {
+			t.Fatal("properties/providers is missing a codebuddy-cn entry — schemas.CodeBuddyCN is a standard provider")
+		}
+		obj, ok := entry.(map[string]interface{})
+		if !ok {
+			t.Fatalf("codebuddy-cn entry should be an object, got %T", entry)
+		}
+		if ref, _ := obj["$ref"].(string); ref != "#/$defs/provider" {
+			t.Errorf("codebuddy-cn should $ref #/$defs/provider, got %q", ref)
+		}
+	})
+
+	t.Run("a key still has to satisfy the provider shape", func(t *testing.T) {
+		// The entry must not be so permissive that a provider without keys slips through.
+		if err := validateConfig(t, compiled, `{"providers": {"codebuddy-cn": {"keys": []}}}`); err == nil {
+			t.Error("an empty keys list must be rejected for codebuddy-cn")
+		}
+	})
+}
+
+// TestSchemaBrowserLoginGrant pins that config.json accepts a browser_login oauth_key_config
+// with its three fields. codebuddy-cn is the provider that uses it; OAuthKeyConfig.Validate
+// already handles the grant, and the schema is the source of truth for config fields, so the
+// closed oauth_key_config block has to declare the grant and its fields too.
+func TestSchemaBrowserLoginGrant(t *testing.T) {
+	compiled := compileSchema(t)
+
+	cfg := `{
+		"providers": {
+			"codebuddy-cn": {
+				"keys": [
+					{
+						"name": "oauth",
+						"weight": 1.0,
+						"models": ["*"],
+						"oauth_key_config": {
+							"grant_type": "browser_login",
+							"token_url": "https://copilot.tencent.com/v2/plugin/auth/token/refresh",
+							"access_token": "env.CODEBUDDY_ACCESS_TOKEN",
+							"refresh_token": "env.CODEBUDDY_REFRESH_TOKEN",
+							"expires_at": "2026-10-22T12:00:00Z"
+						}
+					}
+				]
+			}
+		}
+	}`
+	if err := validateConfig(t, compiled, cfg); err != nil {
+		t.Fatalf("config.json must accept a browser_login oauth_key_config: %v", err)
+	}
+
+	t.Run("the block declares the grant and all three fields", func(t *testing.T) {
+		schema := loadSchema(t)
+		block, found := navigateJSON(schema, "$defs", "base_key", "properties", "oauth_key_config")
+		if !found {
+			t.Fatal("$defs/base_key is missing oauth_key_config")
+		}
+		obj, ok := block.(map[string]interface{})
+		if !ok {
+			t.Fatalf("oauth_key_config should be an object, got %T", block)
+		}
+		grantType, _ := navigateJSON(obj, "properties", "grant_type")
+		enums, _ := navigateJSON(grantType, "enum")
+		list, _ := enums.([]interface{})
+		foundBrowserLogin := false
+		for _, v := range list {
+			if v == "browser_login" {
+				foundBrowserLogin = true
+			}
+		}
+		if !foundBrowserLogin {
+			t.Errorf("grant_type enum must include browser_login, got %v", list)
+		}
+		for _, field := range []string{"access_token", "refresh_token", "expires_at"} {
+			if _, found := navigateJSON(obj, "properties", field); !found {
+				t.Errorf("oauth_key_config is missing %q — OAuthKeyConfig serializes this field", field)
+			}
+		}
+	})
+
+	t.Run("expires_at may be omitted", func(t *testing.T) {
+		body := `"oauth_key_config": {"grant_type": "browser_login", "token_url": "https://copilot.tencent.com/v2/plugin/auth/token/refresh", "refresh_token": "env.R"}`
+		cfg := fmt.Sprintf(`{"providers": {"codebuddy-cn": {"keys": [{"name": "oauth", "models": ["*"], "weight": 1.0, %s}]}}}`, body)
+		if err := validateConfig(t, compiled, cfg); err != nil {
+			t.Errorf("expires_at must stay optional: an empty value means refresh on first use, got: %v", err)
+		}
+	})
 }
 
 // TestSchemaGithubCopilotCredentialRequired pins that the schema demands one of the two
