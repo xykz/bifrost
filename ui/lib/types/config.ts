@@ -355,11 +355,11 @@ export const DefaultOAuthKeyConfig: OAuthKeyConfig = {
 	auth_style: "header",
 	extra_params: {},
 	assertion_lifetime_seconds: 300,
-	access_token: { value: "", ref: "" },
-	refresh_token: { value: "", ref: "" },
-	expires_at: "",
+	// The browser_login fields are deliberately absent: a key that mints its bearer from a token
+	// endpoint would otherwise POST empty access_token/refresh_token/expires_at on every save,
+	// and the server stores what it is given. The login flow fills them in.
 	_auth_type: "api_key",
-} as const satisfies Required<OAuthKeyConfig>;
+} as const satisfies OAuthKeyConfig;
 
 // Key structure matching Go's schemas.Key
 export interface ModelProviderKey {

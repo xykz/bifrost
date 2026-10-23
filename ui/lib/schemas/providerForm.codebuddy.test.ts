@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DefaultNetworkConfig } from "@/lib/constants/config";
-import { codebuddyCNOAuthComplete, ProviderFormSchema } from "./providerForm";
+import { codebuddyCNOAuthComplete, codebuddyCNTokenURL, ProviderFormSchema } from "./providerForm";
 
 // A codebuddy-cn key has exactly two auth modes and the server refuses any other combination:
 // a pasted API key (X-API-Key) or a browser_login bundle (Authorization). The form must agree,
@@ -45,15 +45,37 @@ describe("ProviderFormSchema codebuddy-cn credentials", () => {
 	it("rejects a key with both auth modes", () => {
 		const r = parse({ value: "sk-pasted", oauth_key_config: oauth() });
 		expect(r.success, "a key carrying both a pasted key and a login must not save").toBe(false);
+		if (r.success) return;
+		// The issue must land on the block, not on the value: that is the field the message
+		// points at, and a future rule that rejected for some unrelated reason would fail here.
+		expect(r.error.issues.map((issue) => issue.path.join("."))).toContain("keys.0.oauth_key_config");
 	});
 
 	it("rejects a key with neither auth mode", () => {
 		const r = parse({ value: "", oauth_key_config: undefined });
 		expect(r.success, "a key with no credential at all must not save").toBe(false);
+		if (r.success) return;
+		expect(r.error.issues.map((issue) => issue.path.join("."))).toContain("keys.0.value");
 	});
 
 	it("rejects an incomplete oauth bundle", () => {
 		expect(parse({ value: "", oauth_key_config: oauth({ refresh_token: literal("") }) }).success).toBe(false);
+	});
+
+	// The shared block's "has anyone started typing" heuristic lets a grant with no credential
+	// through, so a grant-only bundle is the case the old check missed.
+	it("rejects a grant-only bundle", () => {
+		const r = parse({ value: "", oauth_key_config: { grant_type: "browser_login" } });
+		expect(r.success).toBe(false);
+		if (r.success) return;
+		expect(r.error.issues.map((issue) => issue.path.join("."))).toEqual(
+			expect.arrayContaining(["keys.0.oauth_key_config.token_url", "keys.0.oauth_key_config.refresh_token"]),
+		);
+	});
+
+	// The server parses the stored string as it arrives, so padding must fail here.
+	it("rejects a padded expiry", () => {
+		expect(parse({ value: "", oauth_key_config: oauth({ expires_at: " 2026-10-22T12:00:00Z " }) }).success).toBe(false);
 	});
 
 	// Only browser_login is valid here: the server refuses any other grant on this provider.
@@ -131,6 +153,77 @@ describe("codebuddyCNOAuthComplete", () => {
 		expect(codebuddyCNOAuthComplete({ ...bundle(), grant_type: "client_credentials" })).toBe(false);
 		expect(codebuddyCNOAuthComplete(bundle({ expires_at: "not a date" }))).toBe(false);
 		expect(codebuddyCNOAuthComplete(bundle({ refresh_token: literal("") }))).toBe(false);
+	});
+
+	// The shared schema lets a grant with no credential through; this predicate must not.
+	it("rejects a grant with no credential fields", () => {
+		expect(codebuddyCNOAuthComplete({ grant_type: "browser_login" })).toBe(false);
+		expect(
+			codebuddyCNOAuthComplete({
+				grant_type: "browser_login",
+				token_url: literal("https://copilot.tencent.com/v2/plugin/auth/token/refresh"),
+			}),
+		).toBe(false);
+	});
+});
+
+// Task 9 builds the bundle from the poll response, which carries no token URL: the host comes
+// from the provider's configured base_url, exactly as the login handler resolves it.
+describe("codebuddyCNTokenURL", () => {
+	it("defaults to the CN gateway", () => {
+		expect(codebuddyCNTokenURL()).toBe("https://copilot.tencent.com/v2/plugin/auth/token/refresh");
+		expect(codebuddyCNTokenURL("")).toBe("https://copilot.tencent.com/v2/plugin/auth/token/refresh");
+		expect(codebuddyCNTokenURL("   ")).toBe("https://copilot.tencent.com/v2/plugin/auth/token/refresh");
+	});
+
+	it("follows a configured base URL, with or without a trailing slash", () => {
+		const expected = "https://codebuddy.internal.example/v2/plugin/auth/token/refresh";
+		expect(codebuddyCNTokenURL("https://codebuddy.internal.example")).toBe(expected);
+		expect(codebuddyCNTokenURL("https://codebuddy.internal.example/")).toBe(expected);
+		expect(codebuddyCNTokenURL("https://codebuddy.internal.example///")).toBe(expected);
+		expect(codebuddyCNTokenURL(" http://127.0.0.1:8080 ")).toBe("http://127.0.0.1:8080/v2/plugin/auth/token/refresh");
+	});
+
+	it("produces a URL the bundle schema accepts", () => {
+		expect(
+			codebuddyCNOAuthComplete({
+				grant_type: "browser_login",
+				token_url: { value: codebuddyCNTokenURL("https://proxy.example") },
+				refresh_token: { value: "r" },
+			}),
+		).toBe(true);
+	});
+
+	// Task 9 may import from either module; they must be the same function, not two copies that
+	// can drift.
+	it("is the same helper the shared module exports", async () => {
+		const shared = await import("@/lib/types/schemas");
+		expect(shared.codebuddyCNTokenURL).toBe(codebuddyCNTokenURL);
+		expect(shared.codebuddyCNOAuthComplete).toBe(codebuddyCNOAuthComplete);
+	});
+});
+
+// A bundle the save path drops must not read as connected: the predicate and
+// stripOAuthAuthDiscriminator ask the same question so the form cannot show a credential the
+// save silently discards.
+describe("codebuddyCNOAuthComplete and the save path", () => {
+	const literal = (value: string) => ({ value, ref: "" });
+	const whole = {
+		grant_type: "browser_login",
+		token_url: literal("https://copilot.tencent.com/v2/plugin/auth/token/refresh"),
+		refresh_token: literal("refresh-xyz"),
+	};
+
+	it("reads a complete bundle with no discriminator as connected", () => {
+		expect(codebuddyCNOAuthComplete(whole)).toBe(true);
+	});
+
+	it("does not read the api-key tab's discriminator as connected", () => {
+		expect(codebuddyCNOAuthComplete({ ...whole, _auth_type: "api_key" })).toBe(false);
+	});
+
+	it("reads an explicit oauth choice as connected once the bundle is whole", () => {
+		expect(codebuddyCNOAuthComplete({ ...whole, _auth_type: "oauth" })).toBe(true);
 	});
 });
 

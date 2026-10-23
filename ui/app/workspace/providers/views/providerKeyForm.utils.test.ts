@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { codebuddyCNOAuthComplete } from "@/lib/types/schemas";
 import { applyAuthMethod, stripDatabricksAuthDiscriminator, stripOAuthAuthDiscriminator } from "./providerKeyForm.utils";
 
 const pair = { client_id: { value: "sp-id" }, client_secret: { value: "sp-secret" } };
@@ -103,6 +104,24 @@ describe("stripOAuthAuthDiscriminator", () => {
 // say explicitly what it is clearing: an empty value on the OAuth path, a null section on the
 // API-key path. Otherwise a stored static key survives the switch and, since resolveKey prefers
 // it, keeps being sent until it expires.
+describe("stripOAuthAuthDiscriminator and codebuddyCNOAuthComplete agree", () => {
+	const refreshURL = { value: "https://copilot.tencent.com/v2/plugin/auth/token/refresh" };
+	const whole = { grant_type: "browser_login" as const, token_url: refreshURL, refresh_token: { value: "r" } };
+
+	// One helper answers "is this block a credential?" for both, so the form cannot show
+	// "signed in" for a block the save discards.
+	it.each([
+		["a complete bundle", whole, true],
+		["a complete bundle with the oauth tab chosen", { ...whole, _auth_type: "oauth" as const }, true],
+		["a complete bundle behind the api-key tab", { ...whole, _auth_type: "api_key" as const }, false],
+		["a grant with no token", { grant_type: "browser_login" as const }, false],
+	])("%s", (_name, config, expected) => {
+		const sent = stripOAuthAuthDiscriminator(config as never);
+		expect(codebuddyCNOAuthComplete(config)).toBe(expected);
+		expect(sent !== undefined).toBe(expected);
+	});
+});
+
 describe("applyAuthMethod", () => {
 	const tokenUrl = { value: "https://idp.example.com/oauth2/token" };
 	const oauth = {
@@ -138,6 +157,45 @@ describe("applyAuthMethod", () => {
 	it("leaves a key without the section alone", () => {
 		const out = applyAuthMethod({ name: "k", value: { value: "sk" } }, true);
 		expect(out).toEqual({ name: "k", value: { value: "sk" } });
+	});
+
+	// The form seeds DefaultOAuthKeyConfig and the update API keeps what it receives, so the
+	// browser-login fields must not ride along on another grant.
+	it("drops the browser-login fields on the other grants", () => {
+		const seeded = {
+			...oauth,
+			access_token: { value: "" },
+			refresh_token: { value: "" },
+			expires_at: "",
+		};
+		const out = applyAuthMethod({ name: "k", value: undefined, oauth_key_config: seeded }, false);
+		expect(out.oauth_key_config).not.toHaveProperty("access_token");
+		expect(out.oauth_key_config).not.toHaveProperty("refresh_token");
+		expect(out.oauth_key_config).not.toHaveProperty("expires_at");
+	});
+
+	it("keeps the browser-login fields on the browser-login grant", () => {
+		const out = applyAuthMethod(
+			{
+				name: "k",
+				value: { value: "" },
+				oauth_key_config: {
+					_auth_type: "oauth",
+					grant_type: "browser_login",
+					token_url: { value: "https://copilot.tencent.com/v2/plugin/auth/token/refresh" },
+					access_token: { value: "a" },
+					refresh_token: { value: "r" },
+					expires_at: "2026-10-22T12:00:00Z",
+				},
+			},
+			false,
+		);
+		expect(out.oauth_key_config).toMatchObject({
+			grant_type: "browser_login",
+			access_token: { value: "a" },
+			refresh_token: { value: "r" },
+			expires_at: "2026-10-22T12:00:00Z",
+		});
 	});
 });
 // Every auth tab that does not use the static key has the same problem the OAuth tab solves

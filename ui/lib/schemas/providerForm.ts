@@ -1,6 +1,7 @@
 import { KnownProvidersNames } from "@/lib/constants/logs";
 import {
 	aliasConfigSchema,
+	codebuddyCNKeyAuthIssues,
 	githubCopilotKeyConfigComplete,
 	githubCopilotKeyConfigSchema,
 	oauthKeyConfigComplete,
@@ -218,26 +219,17 @@ const ReplicateKeyConfigSchema = z.object({
 	use_deployments_endpoint: z.boolean().optional(),
 });
 
-// codebuddy-cn's browser-login credential: the shared OAuth block narrowed to the only grant
-// the server accepts for this provider. Task 9 types the login modal's `onSuccess` payload with
-// it; `codebuddyCNOAuthComplete` is the single source of truth for "this bundle is usable".
-export const codebuddyCNOAuthSchema = oauthKeyConfigSchema.safeExtend({
-	grant_type: z.literal("browser_login"),
-});
-
-// codebuddyCNOAuthComplete reports whether a key's oauth_key_config is a usable browser-login
-// bundle. Judging it through the schema means "complete" cannot drift from what the form accepts:
-// a bundle without a refresh token, or with an unparseable expiry, is not usable. The parameter is
-// `unknown` so the login modal can pass a freshly built payload without a cast.
-//
-// `_auth_type` is dropped first, exactly as the save path does: the shared block's superRefine
-// treats `_auth_type: "api_key"` as an inert placeholder and skips its checks, which would read a
-// half-filled bundle as connected.
-export const codebuddyCNOAuthComplete = (cfg: unknown): boolean => {
-	if (!cfg || typeof cfg !== "object") return false;
-	const { _auth_type: _ignored, ...payload } = cfg as Record<string, unknown>;
-	return payload.grant_type === "browser_login" && codebuddyCNOAuthSchema.safeParse(payload).success;
-};
+// The codebuddy-cn auth rule and its predicate live in @/lib/types/schemas next to
+// oauthKeyConfigSchema, because the live key editor resolves with that module's key schema. They
+// are re-exported here so the provider-creation form and Task 9's fragment keep one import site.
+export {
+	codebuddyCNKeyAuthIssues,
+	codebuddyCNOAuthComplete,
+	codebuddyCNOAuthIssues,
+	codebuddyCNOAuthSchema,
+	codebuddyCNTokenURL,
+	oauthKeyConfigIsSent,
+} from "@/lib/types/schemas";
 
 const KeySchema = z.object({
 	id: z.string(),
@@ -353,46 +345,15 @@ export const ProviderFormSchema = z
 			// Validate individual key values based on provider type
 			const effectiveProviderType = data.baseProviderType || data.selectedProvider;
 			data.keys.forEach((key, index) => {
-				// codebuddy-cn has exactly two auth modes and the server refuses any other
-				// combination: a pasted API key (X-API-Key) or a browser_login bundle
-				// (Authorization). Both would persist a key whose configured login is silently
-				// unused; neither leaves a key that can never authenticate.
 				if (effectiveProviderType === "codebuddy-cn") {
-					const hasValue = !!key.value.trim();
-					// An `_auth_type: "api_key"` block is the inert placeholder the key form
-					// registers; the save path strips it, so the server never sees it and it must
-					// not count as a second auth mode here either.
-					const oauth = key.oauth_key_config?._auth_type === "api_key" ? undefined : key.oauth_key_config;
-					if (hasValue && oauth) {
-						ctx.addIssue({
-							code: z.ZodIssueCode.custom,
-							message: "A CodeBuddy CN key takes either a pasted API key or an OAuth login, not both",
-							path: ["keys", index, "oauth_key_config"],
-						});
-					} else if (!hasValue && !oauth) {
-						ctx.addIssue({
-							code: z.ZodIssueCode.custom,
-							message: "Paste an API key or sign in with OAuth",
-							path: ["keys", index, "value"],
-						});
-					} else if (oauth) {
-						// The shared block accepts every grant, so a client_credentials or
-						// jwt_bearer bundle has to be refused here: only browser_login is valid.
-						if (oauth.grant_type !== "browser_login") {
-							ctx.addIssue({
-								code: z.ZodIssueCode.custom,
-								message: "CodeBuddy CN keys use the browser login grant",
-								path: ["keys", index, "oauth_key_config", "grant_type"],
-							});
-						} else if (!codebuddyCNOAuthComplete(oauth)) {
-							// With no pasted value this block is the only credential, so a partial
-							// bundle would save a key that can never authenticate.
-							ctx.addIssue({
-								code: z.ZodIssueCode.custom,
-								message: "The OAuth login is incomplete; sign in again",
-								path: ["keys", index, "oauth_key_config"],
-							});
-						}
+					// One rule, shared with the live key editor's schema: exactly one credential,
+					// and that credential usable. Paths are key-relative, so they prefix here.
+					const issues = codebuddyCNKeyAuthIssues({
+						hasValue: !!key.value.trim(),
+						oauthKeyConfig: key.oauth_key_config,
+					});
+					for (const issue of issues) {
+						ctx.addIssue({ code: z.ZodIssueCode.custom, message: issue.message, path: ["keys", index, ...issue.path] });
 					}
 					return;
 				}

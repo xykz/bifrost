@@ -1,5 +1,19 @@
-import { databricksKeyConfigSchema, oauthKeyConfigComplete, oauthKeyConfigSchema } from "@/lib/types/schemas";
+import {
+	databricksKeyConfigSchema,
+	modelProviderKeySchemaForProvider,
+	oauthKeyConfigIsSent,
+	oauthKeyConfigSchema,
+} from "@/lib/types/schemas";
 import { z } from "zod";
+
+// providerKeyFormSchema is the resolver schema for the live key editor, in the wrapper shape the
+// form holds ({key: ...}). It takes the provider because the key's auth rules depend on it: the
+// shared modelProviderKeySchema cannot know which provider it is validating, and the codebuddy-cn
+// rule (exactly one credential) must reject a payload the server would 400 on.
+export const providerKeyFormSchema = (provider: string) =>
+	z.object({
+		key: modelProviderKeySchemaForProvider(provider.toLowerCase()),
+	});
 
 type DatabricksKeyConfigForm = z.input<typeof databricksKeyConfigSchema>;
 type OAuthKeyConfigForm = z.input<typeof oauthKeyConfigSchema>;
@@ -28,13 +42,11 @@ export const stripDatabricksAuthDiscriminator = (config: DatabricksKeyConfigForm
 // to the API, and drops the whole block on the API-key path: the form registers it for every
 // openai-based key, and an inert block would be refused by the API as half-configured. A whole
 // block with no discriminator is a valid OAuth key whose discriminator was never re-seeded, and
-// is kept.
+// is kept. The "is this a credential?" decision is oauthKeyConfigIsSent, shared with
+// codebuddyCNOAuthComplete so the fragment's "signed in" state and this strip cannot disagree.
 export const stripOAuthAuthDiscriminator = (config: OAuthKeyConfigForm | undefined): OAuthKeyConfigPayload | undefined => {
-	if (!config) return undefined;
+	if (!config || !oauthKeyConfigIsSent(config)) return undefined;
 	const { _auth_type, ...rest } = config;
-	if (_auth_type === "api_key" || (_auth_type !== "oauth" && !oauthKeyConfigComplete(rest))) {
-		return undefined;
-	}
 	if (rest.grant_type === "client_credentials") {
 		delete rest.private_key;
 		delete rest.issuer;
@@ -46,6 +58,14 @@ export const stripOAuthAuthDiscriminator = (config: OAuthKeyConfigForm | undefin
 		delete rest.client_id;
 		delete rest.client_secret;
 		delete rest.auth_style;
+	}
+	// The browser-login fields belong to that grant alone. Sending them on another grant would
+	// store empty access_token/refresh_token/expires_at on every save, and the update API keeps
+	// what it receives.
+	if (rest.grant_type !== "browser_login") {
+		delete rest.access_token;
+		delete rest.refresh_token;
+		delete rest.expires_at;
 	}
 	if (rest.scopes && rest.scopes.length === 0) delete rest.scopes;
 	if (rest.extra_params && Object.keys(rest.extra_params).length === 0) delete rest.extra_params;

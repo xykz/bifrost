@@ -480,9 +480,12 @@ const isLiteralHTTPSOrLoopbackURL = (v: { value?: string; ref?: string; type?: s
 // so the form rejects what that layout cannot read. Go accepts fractional seconds and gives the
 // zone offset no range check, so neither is enforced here; the calendar date is, because Go
 // rejects 2026-02-30 and a form that lets it through would 400 on save.
+//
+// The value is matched untrimmed on purpose: the server parses the stored string as it arrives,
+// so a padded " 2026-10-22T12:00:00Z " must fail here rather than at save.
 const RFC3339_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 const isRFC3339 = (value: string): boolean => {
-	const match = RFC3339_PATTERN.exec(value.trim());
+	const match = RFC3339_PATTERN.exec(value);
 	if (!match) return false;
 	const [year, month, day, hour, minute, second] = match.slice(1, 7).map(Number);
 	if (month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59) return false;
@@ -587,6 +590,124 @@ export const oauthKeyConfigSchema = z
 			}
 		}
 	});
+
+// OAuthKeyConfig as the form holds it, before the UI-only discriminator is stripped.
+type OAuthKeyConfigInput = z.input<typeof oauthKeyConfigSchema>;
+
+// oauthKeyConfigIsSent is the save path's own question — "will this block reach the API?" —
+// asked in the place both the form and the payload builder can share. stripOAuthAuthDiscriminator
+// in the key form drops a block when the API-key tab owns it, and keeps an explicitly chosen
+// OAuth block even while it is still incomplete. Anything that decides a bundle is "connected"
+// or "usable" has to answer the same way, or the form can show a credential the save drops.
+export const oauthKeyConfigIsSent = (config: OAuthKeyConfigInput | undefined): boolean => {
+	if (!config) return false;
+	const { _auth_type, ...rest } = config;
+	if (_auth_type === "api_key") return false;
+	return _auth_type === "oauth" || oauthKeyConfigComplete(rest);
+};
+
+export interface KeyAuthIssue {
+	path: (string | number)[];
+	message: string;
+}
+
+// codebuddyCNOAuthIssues states what is wrong with a browser-login bundle, relative to the block.
+// Paths are block-relative so both the standalone schema and the key schema can use it, and the
+// messages are the ones Task 9's form fragment shows under each field.
+export const codebuddyCNOAuthIssues = (oauth: OAuthKeyConfigInput): KeyAuthIssue[] => {
+	if (oauth.grant_type !== "browser_login") {
+		return [{ path: ["grant_type"], message: "CodeBuddy CN keys use the browser login grant" }];
+	}
+	const issues: KeyAuthIssue[] = [];
+	// The shared block treats "nobody has typed anything yet" as valid, because the API-key tab
+	// leaves it inert. For codebuddy-cn this block is the only credential, so both fields are
+	// required outright rather than inferred from that heuristic.
+	if (!isSecretVarSet(oauth.token_url)) {
+		issues.push({ path: ["token_url"], message: "Token URL is required" });
+	}
+	if (!isSecretVarSet(oauth.refresh_token)) {
+		issues.push({ path: ["refresh_token"], message: "Refresh token is required for a browser login" });
+	}
+	if (oauth.expires_at && !isRFC3339(oauth.expires_at)) {
+		issues.push({ path: ["expires_at"], message: "Expiry must be an RFC3339 timestamp" });
+	}
+	return issues;
+};
+
+// codebuddyCNOAuthStarted reports whether the user has engaged with the OAuth block at all. The
+// key form registers it for every key, so an untouched block must read as "no second credential"
+// rather than as a half-configured one; once any field or the OAuth tab is chosen, its faults
+// belong on its own fields.
+const codebuddyCNOAuthStarted = (oauth: OAuthKeyConfigInput | undefined): boolean => {
+	if (!oauth) return false;
+	if (oauth._auth_type === "api_key") return false;
+	return (
+		oauth._auth_type === "oauth" ||
+		!!oauth.grant_type ||
+		isSecretVarSet(oauth.token_url) ||
+		isSecretVarSet(oauth.refresh_token) ||
+		isSecretVarSet(oauth.access_token)
+	);
+};
+
+// codebuddyCNKeyAuthIssues is the whole rule for one codebuddy-cn key: exactly one credential, and
+// that credential usable. It is shared by ProviderFormSchema (provider creation) and by
+// modelProviderKeySchemaForProvider (the live key editor) so the two cannot disagree. Paths are
+// key-relative: the callers own the prefix.
+export const codebuddyCNKeyAuthIssues = (input: { hasValue: boolean; oauthKeyConfig: OAuthKeyConfigInput | undefined }): KeyAuthIssue[] => {
+	const { hasValue, oauthKeyConfig: oauth } = input;
+	const sent = oauthKeyConfigIsSent(oauth);
+	if (hasValue && sent) {
+		return [{ path: ["oauth_key_config"], message: "A CodeBuddy CN key takes either a pasted API key or an OAuth login, not both" }];
+	}
+	if (hasValue) {
+		// The pasted key is the credential; an inert or unfinished block is dropped by the save
+		// path and cannot conflict with it.
+		return [];
+	}
+	// The block is the only thing that could authenticate this key. An untouched one (the
+	// API-key tab's placeholder, or a block nobody filled in) is simply absent, and the message
+	// belongs on the field the user can act on rather than under a grant picker they never saw.
+	if (!codebuddyCNOAuthStarted(oauth)) {
+		return [{ path: ["value"], message: "Paste an API key or sign in with OAuth" }];
+	}
+	// Otherwise report its own faults field by field rather than making the user guess why the
+	// key will not save.
+	return codebuddyCNOAuthIssues(oauth!).map((issue) => ({ path: ["oauth_key_config", ...issue.path], message: issue.message }));
+};
+
+// codebuddy-cn's browser-login credential: the shared block narrowed to the only grant the
+// server accepts for this provider, and to a bundle that is whole on its own.
+export const codebuddyCNOAuthSchema = oauthKeyConfigSchema
+	.safeExtend({
+		grant_type: z.literal("browser_login"),
+	})
+	.superRefine((data, ctx) => {
+		for (const issue of codebuddyCNOAuthIssues(data)) {
+			ctx.addIssue({ code: "custom", path: issue.path, message: issue.message });
+		}
+	});
+
+// codebuddyCNOAuthComplete reports whether a key's oauth_key_config is a usable browser-login
+// bundle. It asks the save path's question first (a block the API-key tab owns is not a credential
+// at all), then the strict schema, so it cannot read as connected a bundle the save drops or one
+// with a grant but no token. The parameter is `unknown` so the login modal can pass a freshly built
+// payload without a cast.
+export const codebuddyCNOAuthComplete = (cfg: unknown): boolean =>
+	!!cfg && typeof cfg === "object" && oauthKeyConfigIsSent(cfg as OAuthKeyConfigInput) && codebuddyCNOAuthSchema.safeParse(cfg).success;
+
+// codebuddyCNDefaultBaseURL is the CN gateway, mirroring core/providers/codebuddycn's default.
+export const codebuddyCNDefaultBaseURL = "https://copilot.tencent.com";
+
+// codebuddyCNTokenURL derives the refresh endpoint a browser_login bundle stores. The host comes
+// from the provider's configured base_url and not from the login response: the poll carries only
+// tokens and an expiry, and the login handler resolves the host the same way (configured base_url,
+// else the CN gateway). A hard-coded public host would send a proxied or private deployment's
+// refresh to copilot.tencent.com.
+export const codebuddyCNTokenURL = (baseURL?: string): string => {
+	const base = (baseURL ?? "").trim().replace(/\/+$/, "");
+	return `${base || codebuddyCNDefaultBaseURL}/v2/plugin/auth/token/refresh`;
+};
 
 // Ollama key config schema
 export const ollamaKeyConfigSchema = z
@@ -815,6 +936,26 @@ export const modelProviderKeySchema = z
 			path: ["value"],
 		},
 	);
+
+// Model provider key schema, narrowed for a provider whose key has exactly one auth mode.
+//
+// This is the schema the live key editor resolves with (ProviderKeyForm). It exists because
+// modelProviderKeySchema is provider-agnostic by design: it is embedded in the provider config,
+// the add-provider request and the cache config, none of which know the key's provider. The
+// form does, so it asks for the narrowed variant and gets the codebuddy-cn rule enforced where
+// the save actually happens.
+export const modelProviderKeySchemaForProvider = (provider: string) => {
+	if (provider !== "codebuddy-cn") return modelProviderKeySchema;
+	return modelProviderKeySchema.superRefine((data, ctx) => {
+		const issues = codebuddyCNKeyAuthIssues({
+			hasValue: isSecretVarSet(data.value),
+			oauthKeyConfig: data.oauth_key_config,
+		});
+		for (const issue of issues) {
+			ctx.addIssue({ code: "custom", path: issue.path, message: issue.message });
+		}
+	});
+};
 
 // Network config schema
 export const networkConfigSchema = z

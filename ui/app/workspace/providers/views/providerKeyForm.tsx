@@ -5,17 +5,16 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { getErrorMessage } from "@/lib/store";
 import { useCreateProviderKeyMutation, useGetProviderKeysQuery, useUpdateProviderKeyMutation } from "@/lib/store/apis/providersApi";
 import { ModelProvider } from "@/lib/types/config";
-import { modelProviderKeySchema } from "@/lib/types/schemas";
+import { ModelProviderKeySchema } from "@/lib/types/schemas";
 import { RbacOperation, RbacResource, useRbac } from "@enterprise/lib";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Save } from "lucide-react";
-import { useCallback, useEffect } from "react";
+import { useCallback, useEffect, useMemo } from "react";
 import { useForm } from "react-hook-form";
 import { toast } from "sonner";
 import { v4 as uuid } from "uuid";
-import { z } from "zod";
 import { ApiKeyFormFragment } from "../fragments";
-import { applyAuthMethod } from "./providerKeyForm.utils";
+import { applyAuthMethod, providerKeyFormSchema } from "./providerKeyForm.utils";
 interface Props {
 	provider: ModelProvider;
 	keyId: string | null;
@@ -23,12 +22,7 @@ interface Props {
 	onSave: () => void;
 }
 
-// Create a simple form schema using only ModelProviderKeySchema
-const providerKeyFormSchema = z.object({
-	key: modelProviderKeySchema,
-});
-
-type ProviderKeyFormValues = z.infer<typeof modelProviderKeySchema>;
+type ProviderKeyFormValues = ModelProviderKeySchema;
 
 export default function ProviderKeyForm({ provider, keyId, onCancel, onSave }: Props) {
 	const hasUpdateProviderAccess = useRbac(RbacResource.ModelProvider, RbacOperation.Update);
@@ -38,8 +32,14 @@ export default function ProviderKeyForm({ provider, keyId, onCancel, onSave }: P
 	const isEditing = keyId !== null;
 	const currentKey = keyId ? keys.find((k) => k.id === keyId) : undefined;
 
+	// The schema is provider-aware: codebuddy-cn has two mutually exclusive auth modes and the
+	// server refuses a key that carries both or neither. Keying it on the provider name and
+	// custom base provider keeps it correct for a custom provider that resolves to codebuddy-cn.
+	const providerType = provider.custom_provider_config?.base_provider_type || provider.name;
+	const formSchema = useMemo(() => providerKeyFormSchema(providerType), [providerType]);
+
 	const form = useForm({
-		resolver: zodResolver(providerKeyFormSchema),
+		resolver: zodResolver(formSchema),
 		mode: "onChange",
 		reValidateMode: "onChange",
 		defaultValues: {
