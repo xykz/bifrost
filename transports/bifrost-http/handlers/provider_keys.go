@@ -346,6 +346,10 @@ func (h *ProviderHandler) updateProviderKey(ctx *fasthttp.RequestCtx) {
 			SendError(ctx, fasthttp.StatusConflict, "API key names must be unique across providers. Choose a different name")
 			return
 		}
+		if errors.Is(err, lib.ErrInvalidKeyCredential) {
+			SendError(ctx, fasthttp.StatusBadRequest, err.Error())
+			return
+		}
 		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to update provider key: %v", err))
 		return
 	}

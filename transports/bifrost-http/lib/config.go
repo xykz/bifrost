@@ -8958,7 +8958,7 @@ func skipDBUpdate(ctx context.Context) bool {
 //
 // Anything not listed here (ID, Status, ConfigHash) comes from `stored`: none of it is editable
 // through the API, and Status is owned by health tracking.
-func operatorKeyRow(incoming, stored schemas.Key, readTokens *schemas.OAuthKeyConfig) schemas.Key {
+func operatorKeyRow(incoming, stored schemas.Key, readTokens *schemas.OAuthKeyConfig) (schemas.Key, error) {
 	row := stored
 	row.Name = incoming.Name
 	row.Value = incoming.Value
@@ -8977,64 +8977,107 @@ func operatorKeyRow(incoming, stored schemas.Key, readTokens *schemas.OAuthKeyCo
 	row.DatabricksKeyConfig = incoming.DatabricksKeyConfig
 	row.GithubCopilotKeyConfig = incoming.GithubCopilotKeyConfig
 	row.CloudflareKeyConfig = incoming.CloudflareKeyConfig
-	row.OAuthKeyConfig = operatorOAuthKeyConfig(incoming.OAuthKeyConfig, stored.OAuthKeyConfig, readTokens)
+	oauth, err := operatorOAuthKeyConfig(incoming.OAuthKeyConfig, stored.OAuthKeyConfig, readTokens)
+	if err != nil {
+		return schemas.Key{}, err
+	}
+	row.OAuthKeyConfig = oauth
 	row.Enabled = incoming.Enabled
 	row.UseForBatchAPI = incoming.UseForBatchAPI
 	row.UseAnthropicEndpoints = incoming.UseAnthropicEndpoints
 	row.UseOpenAIEndpoints = incoming.UseOpenAIEndpoints
 	row.Description = incoming.Description
-	return row
+	return row, nil
 }
 
 // operatorOAuthKeyConfig decides whether a save's rotating tokens are written through or replaced
-// by the stored pair.
+// by the stored pair, and guarantees that a masked placeholder is never persisted.
 //
-// The rule is about provenance, not about distrusting every save. If the incoming pair still equals
-// the pair the caller read, the client is echoing what it was given — typically because it never
-// touched the section, or because it sent the mask it was shown — and the stored pair wins, since a
-// rotation may have replaced it in between and upstream has invalidated the old refresh token.
-// If the pair differs from what was read, the caller is supplying a new credential (a re-login),
-// and it is written through together with its own expiry.
+// Two concerns are handled in order, because judging before normalizing gets both wrong.
 //
-// Both tokens are decided as a pair: a fresh login carries an access token and a refresh token from
-// the same exchange, so mixing one echoed and one new value would store a combination that never
-// existed. When there is nothing stored there is nothing to preserve, so the incoming pair is
-// written through — that is what makes "add a login to a key that previously used a pasted value"
-// work.
-func operatorOAuthKeyConfig(incoming, stored, readTokens *schemas.OAuthKeyConfig) *schemas.OAuthKeyConfig {
+// First, each token field is resolved on its own. A masked placeholder is a redaction of something
+// the client was shown, never a credential; an absent field carries no new credential either. Both
+// mean "keep what is stored", when there is something stored. Any other value is a literal the
+// client is supplying. The expiry follows the tokens: if either one had to come from storage, the
+// stored expiry is the consistent choice, and only a pair of genuinely new literals brings its own.
+//
+// Second, the resolved pair is compared with what the request read. A field is unchanged when it
+// came from storage or when its literal equals the read-time value — including both being absent,
+// which is the normal shape of a browser_login key before its first refresh. If no field carries a
+// new literal, the save is an echo and all three stored fields win; otherwise the client is
+// supplying a new credential (a re-login) and the resolved pair is written through.
+//
+// Deciding on "did any new literal arrive" rather than on the raw incoming values is what makes the
+// refresh-only key work: its read-time access token is nil, so the access token resolved from
+// storage can never equal what was read, and a comparison that ignored provenance would call every
+// such save a re-login and persist the superseded refresh token.
+func operatorOAuthKeyConfig(incoming, stored, readTokens *schemas.OAuthKeyConfig) (*schemas.OAuthKeyConfig, error) {
 	if incoming == nil {
 		// An explicit null clears the block; there is nothing left to preserve.
-		return nil
+		return nil, nil
 	}
 	cfg := *incoming
-	if stored == nil || readTokens == nil {
-		// Nothing stored, or no read snapshot to compare against: the save is authoritative.
-		return &cfg
+
+	var storedAccess, storedRefresh *schemas.SecretVar
+	if stored != nil {
+		storedAccess, storedRefresh = stored.AccessToken, stored.RefreshToken
 	}
-	if !tokenEchoesRead(incoming.AccessToken, readTokens.AccessToken) ||
-		!tokenEchoesRead(incoming.RefreshToken, readTokens.RefreshToken) {
-		return &cfg
+	// A mask with nothing behind it cannot be resolved. It is refused rather than dropped: dropping
+	// an access token would silently downgrade the key, and dropping the refresh token would leave a
+	// browser_login block that validates but can never mint again. A mask against a stored block that
+	// happens not to carry that field is different — the redaction stood for "unset" — and resolves
+	// to unset below.
+	if stored == nil && (incoming.AccessToken.IsMaskedPlaceholder() || incoming.RefreshToken.IsMaskedPlaceholder()) {
+		return nil, fmt.Errorf("%w: oauth_key_config.access_token and oauth_key_config.refresh_token cannot be a masked preview when no stored value exists", ErrInvalidKeyCredential)
 	}
-	cfg.AccessToken = stored.AccessToken
-	cfg.RefreshToken = stored.RefreshToken
-	cfg.ExpiresAt = stored.ExpiresAt
-	return &cfg
+	access, accessFromStored := resolveRotatingToken(incoming.AccessToken, storedAccess)
+	refresh, refreshFromStored := resolveRotatingToken(incoming.RefreshToken, storedRefresh)
+
+	cfg.AccessToken = access
+	cfg.RefreshToken = refresh
+	if stored != nil {
+		if accessFromStored || refreshFromStored {
+			cfg.ExpiresAt = stored.ExpiresAt
+		}
+	}
+
+	if readTokens == nil {
+		// No read snapshot to judge against, so the resolved pair is authoritative.
+		return &cfg, nil
+	}
+	if tokenUnchanged(access, accessFromStored, readTokens.AccessToken) &&
+		tokenUnchanged(refresh, refreshFromStored, readTokens.RefreshToken) {
+		cfg.AccessToken = stored.AccessToken
+		cfg.RefreshToken = stored.RefreshToken
+		cfg.ExpiresAt = stored.ExpiresAt
+	}
+	return &cfg, nil
 }
 
-// tokenEchoesRead reports whether an incoming token is the one the caller read: the same value, a
-// redacted preview of it, or absent (an omitted or null field, which carries no new credential).
-// A nil read value means there was nothing to echo, so any incoming token counts as new.
-func tokenEchoesRead(incoming, read *schemas.SecretVar) bool {
-	if read == nil {
-		return false
+// resolveRotatingToken applies the mask and absence rules to one rotating token field. pick selects
+// the same field from the stored block. It returns the effective value and whether that value came
+// from storage rather than from the request.
+//
+// fromStored matters to the caller's echo decision: a value taken from storage is by definition not
+// something the client just supplied, even when it no longer matches what the client read.
+func resolveRotatingToken(incoming, stored *schemas.SecretVar) (*schemas.SecretVar, bool) {
+	if incoming != nil && !incoming.IsMaskedPlaceholder() {
+		return incoming, false
 	}
-	if incoming == nil {
+	return stored, stored != nil
+}
+
+// tokenUnchanged reports whether a resolved token is the one the request read: it came from storage,
+// or its literal equals the read-time value. Both absent is unchanged — nothing was read and nothing
+// was sent, so nothing new arrived.
+func tokenUnchanged(effective *schemas.SecretVar, fromStored bool, read *schemas.SecretVar) bool {
+	if fromStored {
 		return true
 	}
-	if incoming.IsMaskedPlaceholder() {
-		return true
+	if effective == nil || read == nil {
+		return effective == nil && read == nil
 	}
-	return incoming.GetValue() == read.GetValue()
+	return effective.GetValue() == read.GetValue()
 }
 
 // UpdateProviderKey updates a single key on an existing provider configuration. The incoming key's
@@ -9075,7 +9118,11 @@ func (c *Config) updateProviderKey(ctx context.Context, provider schemas.ModelPr
 
 	updatedConfig := existingConfig
 	updatedConfig.Keys = append([]schemas.Key(nil), existingConfig.Keys...)
-	key = operatorKeyRow(key, existingConfig.Keys[index], readTokens)
+	var err error
+	key, err = operatorKeyRow(key, existingConfig.Keys[index], readTokens)
+	if err != nil {
+		return err
+	}
 	key.ID = keyID
 	updatedConfig.Keys[index] = key
 

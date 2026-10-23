@@ -1967,11 +1967,11 @@ type tokenWriteStore struct {
 	// persistDelay stalls every store call, so a test can prove the request path does not wait
 	// for the write. It is applied to both UpdateProviderKey and GetProviderKey.
 	persistDelay time.Duration
-	// updateDelays, when set, overrides persistDelay per UpdateProviderKey call, first entry
-	// first. It lets a test order two writers deterministically instead of relying on a tie.
-	updateDelays []time.Duration
-	// updates counts UpdateProviderKey calls, including ones still sleeping.
-	updates int
+	// delayFor, when set, returns the delay for one UpdateProviderKey call. It is keyed on the row
+	// being written rather than on arrival order: arrival order is what the test is trying to
+	// control, so using it to assign delays lets the two writes swap and pass a mutation they
+	// should catch.
+	delayFor func(key schemas.Key) time.Duration
 }
 
 func newTokenWriteStore(keys ...schemas.Key) *tokenWriteStore {
@@ -1983,14 +1983,10 @@ func newTokenWriteStore(keys ...schemas.Key) *tokenWriteStore {
 }
 
 func (s *tokenWriteStore) UpdateProviderKey(ctx context.Context, _ schemas.ModelProvider, keyID string, key schemas.Key, _ ...*gorm.DB) error {
-	s.mu.Lock()
-	n := s.updates
-	s.updates++
 	delay := s.persistDelay
-	if n < len(s.updateDelays) {
-		delay = s.updateDelays[n]
+	if s.delayFor != nil {
+		delay = s.delayFor(key)
 	}
-	s.mu.Unlock()
 
 	if delay > 0 {
 		select {
@@ -2727,6 +2723,152 @@ func TestRenameOnlySavePreservesTheRotatedTokens(t *testing.T) {
 	}
 }
 
+// TestEchoIsRecognisedWhenTheReadAccessTokenIsNil is Finding 1's reproduction. A browser_login key
+// is created with a refresh token and no access token, so nil is the canonical post-login state for
+// that field. A rename-only save omits oauth_key_config, decodeKeyUpdate copies the read block, and a
+// comparison that treats nil-vs-nil as divergence declares the pair new and persists the superseded
+// refresh token — Finding A's failure in the one shape none of the other echo tests use.
+func TestEchoIsRecognisedWhenTheReadAccessTokenIsNil(t *testing.T) {
+	SetLogger(&mockLogger{})
+	lib.SetLogger(&mockLogger{})
+
+	freshLogin := func() *schemas.OAuthKeyConfig {
+		return &schemas.OAuthKeyConfig{
+			GrantType:    schemas.OAuthGrantBrowserLogin,
+			TokenURL:     *schemas.NewSecretVar("https://copilot.tencent.com/v2/plugin/auth/token/refresh"),
+			RefreshToken: schemas.NewSecretVar("refresh-1"),
+		}
+	}
+	store := newTokenWriteStore(schemas.Key{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: freshLogin()})
+	config := &lib.Config{
+		ConfigStore: store,
+		Providers: map[schemas.ModelProvider]configstore.ProviderConfig{
+			schemas.CodeBuddyCN: {Keys: []schemas.Key{{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: freshLogin()}}},
+		},
+	}
+	attachBifrostClient(t, config)
+	h := &ProviderHandler{inMemoryStore: config, modelsManager: &mockModelsManager{}}
+
+	readTime, err := config.GetProviderKeyRaw(schemas.CodeBuddyCN, "key-1")
+	if err != nil {
+		t.Fatalf("GetProviderKeyRaw: %v", err)
+	}
+	if readTime.OAuthKeyConfig.AccessToken != nil {
+		t.Fatal("test setup: a freshly created browser_login key has no access token")
+	}
+
+	// The first refresh rotates the durable credential; it also fills in an access token.
+	if err := config.UpdateProviderKeyTokens(context.Background(), schemas.CodeBuddyCN, "key-1", "access-2", "refresh-2", "2026-10-22T13:00:00Z"); err != nil {
+		t.Fatalf("UpdateProviderKeyTokens: %v", err)
+	}
+	store.awaitWrites(t, 1)
+
+	updateKey, err := decodeKeyUpdate([]byte(`{"name":"renamed"}`), *readTime)
+	if err != nil {
+		t.Fatalf("decodeKeyUpdate: %v", err)
+	}
+	merged, err := h.mergeUpdatedKey(*readTime, updateKey)
+	if err != nil {
+		t.Fatalf("mergeUpdatedKey: %v", err)
+	}
+	if err := config.UpdateProviderKeyWithReadTokens(context.Background(), schemas.CodeBuddyCN, "key-1", merged, readTime.OAuthKeyConfig); err != nil {
+		t.Fatalf("UpdateProviderKeyWithReadTokens: %v", err)
+	}
+
+	inMemory := storedProviderKey(t, config, "key-1").OAuthKeyConfig
+	if inMemory.RefreshToken.GetValue() != "refresh-2" {
+		t.Fatalf("refresh token = %q, want the rotated refresh-2; a nil read access token was mistaken for a new pair", inMemory.RefreshToken.GetValue())
+	}
+	if inMemory.ExpiresAt != "2026-10-22T13:00:00Z" {
+		t.Fatalf("expiry = %q, want the rotated expiry", inMemory.ExpiresAt)
+	}
+	store.awaitWrites(t, 2)
+	if got := store.storedKey(t, "key-1").OAuthKeyConfig.RefreshToken.GetValue(); got != "refresh-2" {
+		t.Fatalf("store refresh token = %q, want refresh-2", got)
+	}
+}
+
+// TestMaskedAccessTokenWithANewRefreshTokenResolvesTheMask is Finding 2's reproduction. A client that
+// echoes the masked access token but supplies a new refresh token must not persist the asterisks: a
+// masked access token is merely unusable, but a masked refresh token would be unrecoverable.
+func TestMaskedAccessTokenWithANewRefreshTokenResolvesTheMask(t *testing.T) {
+	SetLogger(&mockLogger{})
+	lib.SetLogger(&mockLogger{})
+
+	store := newTokenWriteStore(schemas.Key{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: browserLoginConfig()})
+	config := &lib.Config{
+		ConfigStore: store,
+		Providers: map[schemas.ModelProvider]configstore.ProviderConfig{
+			schemas.CodeBuddyCN: {Keys: []schemas.Key{{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: browserLoginConfig()}}},
+		},
+	}
+	attachBifrostClient(t, config)
+
+	readTime, err := config.GetProviderKeyRaw(schemas.CodeBuddyCN, "key-1")
+	if err != nil {
+		t.Fatalf("GetProviderKeyRaw: %v", err)
+	}
+
+	mixed := *readTime.OAuthKeyConfig
+	mixed.AccessToken = readTime.OAuthKeyConfig.AccessToken.Redacted()
+	mixed.RefreshToken = schemas.NewSecretVar("refresh-new")
+	mixed.ExpiresAt = "2026-10-22T15:00:00Z"
+	if err := config.UpdateProviderKeyWithReadTokens(context.Background(), schemas.CodeBuddyCN, "key-1", schemas.Key{
+		ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: &mixed,
+	}, readTime.OAuthKeyConfig); err != nil {
+		t.Fatalf("UpdateProviderKeyWithReadTokens: %v", err)
+	}
+
+	inMemory := storedProviderKey(t, config, "key-1").OAuthKeyConfig
+	if inMemory.AccessToken.GetValue() != "access-stored" {
+		t.Fatalf("access token = %q, want the stored credential, never the mask", inMemory.AccessToken.GetValue())
+	}
+	if inMemory.AccessToken.IsMaskedPlaceholder() {
+		t.Fatalf("a masked placeholder was persisted as the access token: %q", inMemory.AccessToken.GetValue())
+	}
+	if inMemory.RefreshToken.GetValue() != "refresh-new" {
+		t.Fatalf("refresh token = %q, want the new literal", inMemory.RefreshToken.GetValue())
+	}
+	// One field came from storage, so the stored expiry is the consistent choice.
+	if inMemory.ExpiresAt != "2026-10-22T12:00:00Z" {
+		t.Fatalf("expiry = %q, want the stored expiry", inMemory.ExpiresAt)
+	}
+
+	store.awaitWrites(t, 1)
+	if got := store.storedKey(t, "key-1").OAuthKeyConfig; got.AccessToken.IsMaskedPlaceholder() || got.AccessToken.GetValue() != "access-stored" {
+		t.Fatalf("store access token = %q, want the stored credential", got.AccessToken.GetValue())
+	}
+}
+
+// TestMaskedTokensWithNothingStoredAreRefused pins the stored == nil half of the mask rule. There is
+// no value to resolve a mask to, and silently dropping it would persist a bundle that cannot mint —
+// so the save is refused instead.
+func TestMaskedTokensWithNothingStoredAreRefused(t *testing.T) {
+	SetLogger(&mockLogger{})
+	lib.SetLogger(&mockLogger{})
+
+	pasted := schemas.Key{ID: "key-1", Name: "cb", Weight: 1, Value: *schemas.NewSecretVar("sk-pasted")}
+	config := &lib.Config{
+		Providers: map[schemas.ModelProvider]configstore.ProviderConfig{
+			schemas.CodeBuddyCN: {Keys: []schemas.Key{pasted}},
+		},
+	}
+	attachBifrostClient(t, config)
+
+	masked := browserLoginConfig()
+	masked.AccessToken = masked.AccessToken.Redacted()
+	masked.RefreshToken = masked.RefreshToken.Redacted()
+	err := config.UpdateProviderKeyWithReadTokens(context.Background(), schemas.CodeBuddyCN, "key-1", schemas.Key{
+		ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: masked,
+	}, nil)
+	if !errors.Is(err, lib.ErrInvalidKeyCredential) {
+		t.Fatalf("err = %v, want ErrInvalidKeyCredential", err)
+	}
+	if got := storedProviderKey(t, config, "key-1").OAuthKeyConfig; got != nil {
+		t.Fatalf("the refused save still mutated the key: %+v", got)
+	}
+}
+
 // TestSlowRotationPersistDoesNotClobberALaterEdit pins the observable outcome of Finding B: a slow
 // rotation write overlapping an operator rename must leave the durable row carrying both changes.
 //
@@ -2736,13 +2878,25 @@ func TestRenameOnlySavePreservesTheRotatedTokens(t *testing.T) {
 // The failure it catches is the structural one: if the rotation wrote a row captured when it was
 // scheduled, the rename would be reverted in the store (durable row "cb", memory "renamed") — which
 // is exactly what the mutation check in the report reproduces.
+//
+// Two distinct regressions fail it, which is why the comment names the mechanism rather than a race:
+// a rotation writing a row captured when it was scheduled (the snapshot variant), and a rotation
+// writing without holding c.Mu at all (the round-1 variant, where the two store calls interleave
+// freely and the older row can land last).
 func TestSlowRotationPersistDoesNotClobberALaterEdit(t *testing.T) {
 	SetLogger(&mockLogger{})
 	lib.SetLogger(&mockLogger{})
 
 	store := newTokenWriteStore(schemas.Key{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: browserLoginConfig()})
-	// First UpdateProviderKey (the rotation) takes 400ms; the operator's rename is immediate.
-	store.updateDelays = []time.Duration{400 * time.Millisecond, 0}
+	// The rotation's write carries the pre-rename row, so it is identified by the name it writes:
+	// 400ms. The operator's write carries "renamed" and is immediate. Keying on content rather than
+	// arrival order means the two can never swap.
+	store.delayFor = func(key schemas.Key) time.Duration {
+		if key.Name == "renamed" {
+			return 0
+		}
+		return 400 * time.Millisecond
+	}
 	config := &lib.Config{
 		ConfigStore: store,
 		Providers: map[schemas.ModelProvider]configstore.ProviderConfig{
@@ -2784,18 +2938,25 @@ func TestSlowRotationPersistDoesNotClobberALaterEdit(t *testing.T) {
 }
 
 // TestSlowRotationPersistDoesNotClobberALaterTokenEdit is the same race for the credential itself:
-// the operator cannot set the tokens by hand any more, but a second rotation can land while the
-// first one's write is queued, and the store must end up with the newer pair.
+// a second rotation can land while the first one's write is queued, and the store must end up with
+// the newer pair. (An operator can supply tokens by hand — a re-login — but this case is about the
+// two writers that both mint, so it uses rotations.)
 func TestSlowRotationPersistDoesNotClobberALaterTokenEdit(t *testing.T) {
 	SetLogger(&mockLogger{})
 	lib.SetLogger(&mockLogger{})
 
 	store := newTokenWriteStore(schemas.Key{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: browserLoginConfig()})
 	// Staggered so the OLDER write lands last if the row were captured when the rotation was
-	// applied: the first rotation's write sleeps 300ms, the second's is immediate. With a
+	// applied: the refresh-2 write sleeps 300ms, the refresh-3 write is immediate. With a
 	// captured-at-apply snapshot that ordering ends on access-2/refresh-2 — the superseded pair,
-	// whose refresh token upstream has already invalidated.
-	store.updateDelays = []time.Duration{300 * time.Millisecond, 0}
+	// whose refresh token upstream has already invalidated. Keyed on the token each write carries,
+	// so the assignment cannot invert.
+	store.delayFor = func(key schemas.Key) time.Duration {
+		if key.OAuthKeyConfig != nil && key.OAuthKeyConfig.RefreshToken.GetValue() == "refresh-2" {
+			return 300 * time.Millisecond
+		}
+		return 0
+	}
 	config := &lib.Config{
 		ConfigStore: store,
 		Providers: map[schemas.ModelProvider]configstore.ProviderConfig{
