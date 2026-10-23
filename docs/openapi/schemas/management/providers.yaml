@@ -759,3 +759,55 @@ ListModelDetailsResponse:
         $ref: '#/ModelDetailsResponse'
     total:
       type: integer
+
+CodeBuddyLoginStartResponse:
+  type: object
+  description: A CodeBuddy CN browser login that has been opened upstream.
+  required:
+    - flow_id
+    - auth_url
+    - flow_expires_at
+  properties:
+    flow_id:
+      type: string
+      description: Opaque handle to poll with. The upstream state is never exposed.
+    auth_url:
+      type: string
+      description: The upstream URL the administrator opens to sign in.
+    flow_expires_at:
+      type: string
+      format: date-time
+      description: >-
+        When the browser must finish the sign-in. Deliberately not named `expires_at`: the
+        completed poll uses that name for the access token's expiry, and the two must not be
+        confused.
+
+CodeBuddyLoginStatusResponse:
+  type: object
+  description: >-
+    The state of a CodeBuddy CN browser login. Fields other than `status` are omitted when they
+    do not apply: the token fields appear only on `completed`, `error` only on `failed`.
+  required:
+    - status
+  properties:
+    status:
+      type: string
+      enum: [pending, completed, failed]
+    access_token:
+      type: string
+      description: Completed only. Short-lived bearer for inference.
+    refresh_token:
+      type: string
+      description: Completed only. Durable credential the key stores.
+    token_type:
+      type: string
+      description: Completed only, as the upstream reported it (always `Bearer` today).
+    expires_at:
+      type: string
+      format: date-time
+      description: >-
+        Completed only. The access token's expiry — what the key stores in
+        `oauth_key_config.expires_at`. Not the flow deadline.
+    error:
+      type: string
+      description: Failed only. A message the UI can show, never an upstream token or state.

@@ -1,0 +1,372 @@
+---
+title: "CodeBuddy CN"
+description: "Tencent CodeBuddy (China) API conversion guide - OpenAI-compatible chat and Responses API, X-API-Key or OAuth browser login, static model catalog, and automatic access-token refresh"
+icon: "code"
+---
+
+## Overview
+
+CodeBuddy CN is Tencent's CodeBuddy gateway for mainland China. It exposes an OpenAI-compatible
+chat completions API, so Bifrost delegates request and response shaping to the shared OpenAI
+converters. Four things make it unlike the other OpenAI-compatible providers:
+
+- **Two mutually exclusive auth modes** - a pasted API key travels in `X-API-Key`, an OAuth browser login travels in `Authorization: Bearer`. A key carries one credential, never both.
+- **Short-lived access tokens** - a browser-login key stores a durable refresh token, and Bifrost mints a new access token from it before each expiry.
+- **Editor identity headers** - the gateway refuses requests that look like generic API clients, so Bifrost sends `X-Product` and the `X-IDE-*` trio on every inference call.
+- **Static model catalog** - the gateway serves no model list to an unauthenticated caller, so the catalog is pinned in Bifrost and unknown model ids are passed through.
+
+<Warning>
+The editor-identity headers and the browser-login endpoints are not part of a published Tencent
+API contract. They come from the behaviour of Tencent's own CodeBuddy CLI and can change without
+notice.
+</Warning>
+
+### Supported Operations
+
+| Operation | Non-Streaming | Streaming | Endpoint |
+|-----------|---------------|-----------|----------|
+| Chat Completions | ✅ | ✅ | `/v2/chat/completions` |
+| Responses API | ✅ | ✅ | converted through `/v2/chat/completions` |
+| List Models | ✅ | - | `/v2/models` (pinned catalog when the live listing is absent) |
+| Text Completions | ❌ | ❌ | - |
+| Embeddings | ❌ | ❌ | - |
+| Image Generation | ❌ | ❌ | - |
+| Speech (TTS) | ❌ | ❌ | - |
+| Transcriptions (STT) | ❌ | ❌ | - |
+| Files | ❌ | ❌ | - |
+| Batch | ❌ | ❌ | - |
+| Containers | ❌ | ❌ | - |
+
+<Note>
+**Unsupported Operations** (❌): embeddings, image generation and editing, speech, transcription,
+text completions, files, batch, containers, cached content, token counting, compaction, OCR,
+rerank, video and passthrough are not served by the CodeBuddy gateway through this provider.
+These return `UnsupportedOperationError`.
+</Note>
+
+## Setup & Configuration
+
+Configure CodeBuddy CN as a provider.
+
+<Tabs>
+<Tab title="Web UI">
+
+1. Navigate to **Models** > **Model Providers**. Look for **CodeBuddy CN** under **Configured Providers**. If it is missing, click on **Add New Provider** and select **CodeBuddy CN**.
+2. Click **Add Key** or edit an existing key.
+3. Set a name for your key.
+4. Under **Authentication Method**, pick **API Key** and paste the key (or an `env.` reference), or pick **OAuth login** and click **Sign in**. The two are alternatives: switching tabs clears the other credential.
+5. Set **Allowed Models** to **All Models** (default) or the specific model allowlist you want this key to serve.
+6. Save the provider configuration.
+
+</Tab>
+<Tab title="config.json">
+
+With a pasted API key:
+
+```json
+{
+  "providers": {
+    "codebuddy-cn": {
+      "keys": [
+        {
+          "name": "codebuddy-cn-key-1",
+          "value": "env.CODEBUDDY_CN_API_KEY",
+          "models": [
+            "*"
+          ],
+          "weight": 1.0
+        }
+      ]
+    }
+  }
+}
+```
+
+With a browser-login bundle:
+
+```json
+{
+  "providers": {
+    "codebuddy-cn": {
+      "keys": [
+        {
+          "name": "codebuddy-cn-login",
+          "models": [
+            "*"
+          ],
+          "weight": 1.0,
+          "oauth_key_config": {
+            "grant_type": "browser_login",
+            "token_url": "https://copilot.tencent.com/v2/plugin/auth/token/refresh",
+            "access_token": "env.CODEBUDDY_CN_ACCESS_TOKEN",
+            "refresh_token": "env.CODEBUDDY_CN_REFRESH_TOKEN"
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+`refresh_token` is the durable credential and is required for `browser_login`; `access_token` and
+`expires_at` are optional and are refreshed before use when absent. Leave `value` out when
+`oauth_key_config` is set — a non-empty `value` always wins, and a pasted key is sent as
+`X-API-Key` instead of a bearer.
+
+</Tab>
+<Tab title="API">
+
+Refer to the API documentation for [Provider Keys Management](https://docs.getbifrost.ai/api-reference/providers/create-a-key-for-a-provider).
+The login endpoints are documented in the OpenAPI reference under **Providers**:
+`POST /api/providers/{provider}/codebuddy-cn/login` and
+`GET /api/providers/{provider}/codebuddy-cn/login/{flow_id}`.
+
+</Tab>
+</Tabs>
+
+---
+
+## Authentication
+
+A CodeBuddy CN key carries exactly one credential. The mode is selected by what the key holds:
+
+| Mode | Credential | Header sent |
+|------|------------|-------------|
+| Pasted API key | `value` (supports `env.` and vault references) | `X-API-Key: <key>` |
+| OAuth browser login | `oauth_key_config` with `grant_type: browser_login` | `Authorization: Bearer <access token>` |
+
+The two are mutually exclusive. A non-empty `value` always wins over `oauth_key_config`, and the
+UI clears one when you switch to the other. Sending a pasted key as a bearer is rejected by
+CodeBuddy's front end before credential validation runs, which is why the header differs by mode.
+
+### Browser login
+
+The browser login is an **admin action**, not a per-end-user login. One credential set per key is
+stored and shared by every request the gateway sends with that key: a virtual key or an application
+calling Bifrost does not sign in, and does not see the tokens.
+
+From the Web UI, open the key, choose **OAuth login** and click **Sign in**. Bifrost opens Tencent's
+sign-in page, polls until the browser finishes, then stores the token pair on the key. The button
+reads **Re-authenticate** once a pair is stored.
+
+The same flow is available over the management API. Both endpoints require an authenticated admin
+session, and neither is reachable without one: on a deployment whose dashboard authentication is
+disabled or unconfigured they refuse with `403` instead of minting a credential for anyone on the
+network.
+
+```bash
+# 1. Start the flow. The response carries the URL to open and its deadline.
+curl -X POST http://localhost:8080/api/providers/codebuddy-cn/codebuddy-cn/login
+```
+
+```json
+{
+  "flow_id": "5f0c1e9a-3f0f-4f0e-9f5f-1c2a3b4c5d6e",
+  "auth_url": "https://copilot.tencent.com/...",
+  "flow_expires_at": "2026-10-23T12:15:00Z"
+}
+```
+
+```bash
+# 2. Poll until the flow settles.
+curl http://localhost:8080/api/providers/codebuddy-cn/codebuddy-cn/login/5f0c1e9a-3f0f-4f0e-9f5f-1c2a3b4c5d6e
+```
+
+The poll answers one of three shapes:
+
+```json
+{ "status": "pending" }
+```
+
+```json
+{ "status": "failed", "error": "codebuddy login received an unexpected answer from the provider" }
+```
+
+```json
+{
+  "status": "completed",
+  "access_token": "...",
+  "refresh_token": "...",
+  "token_type": "Bearer",
+  "expires_at": "2026-10-23T13:00:00Z"
+}
+```
+
+`flow_expires_at` is the deadline for the browser to finish (15 minutes). `expires_at` in the
+completed poll is the **access token's** expiry, which is what the key stores — the two are
+different clocks. A settled flow stays readable for five minutes, so a repeat poll returns the same
+answer instead of starting over.
+
+### Token refresh
+
+Bifrost refreshes an access token 60 seconds before its expiry and persists the rotated pair on
+the key. The refresh URL is derived from the provider's base URL:
+`<base_url>/v2/plugin/auth/token/refresh`. Signing in while `network_config.base_url` points at a
+proxy or a private deployment stores that host's refresh URL on the key, rather than the public
+gateway's.
+
+A refresh that returns `401`, or the gateway's `12153` ("refresh token invalid") inside an
+HTTP-200 body, is a **permanent** credential fault. Bifrost does not retry it and does not fall
+back to another provider: the key needs a re-login.
+
+### Re-authenticating a dead refresh token
+
+When the refresh token dies, requests on that key fail with a `401` whose message says the refresh
+token is invalid. Open the provider's key in **Models** > **Model Providers** and click
+**Re-authenticate** under **OAuth login**; the fresh pair replaces the dead one in the same write.
+The same replacement can be sent through the key update endpoint, but it has to carry
+`access_token`, `refresh_token` and `expires_at` together — the sign-in is what produces all three.
+
+<Warning>
+**Deployments without a config store lose a rotated refresh token on restart.** With
+`config_store.enabled: false`, Bifrost keeps the configured keys in memory and rewrites nothing, so
+a rotation performed while the gateway was running exists only in memory. If the gateway restarts
+after that access token expires, the key falls back to the refresh token in `config.json`, which
+the upstream has already invalidated. Re-login once after the restart. With a config store enabled
+(the default), the rotated pair is written back and survives restarts.
+</Warning>
+
+---
+
+## Base URL
+
+The default base URL is `https://copilot.tencent.com`, the host root; the API paths under it start
+with `/v2`, so chat completions are sent to `/v2/chat/completions`.
+
+`network_config.base_url` overrides the host for a proxy or a private deployment. The browser-login
+flow dials the same setting, so an operator who signs in through the proxy also gets a refresh URL
+pointing at it.
+
+```json
+{
+  "providers": {
+    "codebuddy-cn": {
+      "network_config": {
+        "base_url": "https://codebuddy-gateway.internal.example"
+      },
+      "keys": [
+        {
+          "name": "codebuddy-cn-key-1",
+          "value": "env.CODEBUDDY_CN_API_KEY",
+          "models": [
+            "*"
+          ],
+          "weight": 1.0
+        }
+      ]
+    }
+  }
+}
+```
+
+---
+
+# 1. Chat Completions
+
+Identical request and response shape to
+[OpenAI Chat Completions](/providers/supported-providers/openai#1-chat-completions): Bifrost
+delegates shaping to the shared OpenAI converters. The gateway's own API documentation is the
+reference for which optional chat parameters it accepts.
+
+```bash
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "codebuddy-cn/hunyuan-chat",
+    "messages": [{ "role": "user", "content": "Explain a Go channel in two sentences." }]
+  }'
+```
+
+Streaming uses the same endpoint with `"stream": true` and returns Server-Sent Events.
+
+---
+
+# 2. Responses API
+
+Converted through chat completions:
+
+```
+ResponsesRequest → ChatRequest → Response conversion
+```
+
+Both streaming and non-streaming Responses requests are supported on this path.
+
+---
+
+# 3. List Models
+
+```bash
+curl http://localhost:8080/v1/models?provider=codebuddy-cn
+```
+
+The catalog is **static and hand-maintained**, because the gateway serves no model list to an
+unauthenticated caller and its `/v2/models` route currently answers `404`:
+
+```
+hunyuan-chat
+deepseek-v3
+glm-5.2
+```
+
+The key's allowlist, blacklist and aliases apply to this catalog exactly as they would to a live
+listing. A model id that is missing from the catalog is **not** rejected: chat requests pass
+whatever id the caller sends through to the gateway, so a model Tencent adds later works without a
+Bifrost release. Refresh the catalog with `GET /v2/plugin/models` against a live credential when
+the upstream list changes.
+
+---
+
+## Unsupported Features
+
+| Feature | Reason |
+|---------|--------|
+| Embeddings | Not served by the CodeBuddy gateway through this provider |
+| Image Generation / Editing | Not served by the CodeBuddy gateway through this provider |
+| Speech / Transcription | Not served by the CodeBuddy gateway through this provider |
+| Text Completions | Not served by the CodeBuddy gateway through this provider |
+| Batch Operations | Not served by the CodeBuddy gateway through this provider |
+| File Management | Not served by the CodeBuddy gateway through this provider |
+| Container Management | Not served by the CodeBuddy gateway through this provider |
+| Cached Content | Only Gemini and Vertex AI support cached content in Bifrost |
+| Token Counting | Not served by the CodeBuddy gateway through this provider |
+| Rerank / OCR / Video | Not served by the CodeBuddy gateway through this provider |
+| Passthrough | Not served by the CodeBuddy gateway through this provider |
+
+---
+
+## Caveats
+
+<Accordion title="Rotated Refresh Token Needs a Config Store">
+**Severity**: High
+**Behavior**: A rotation is persisted to the config store when one is enabled; with `config_store.enabled: false` it lives in memory only
+**Impact**: A restart after the access token has expired falls back to the refresh token in `config.json`, which the upstream already invalidated, so the key needs a re-login
+**Code**: `persistRotatedCredential` in `transports/bifrost-http/handlers/codebuddycredential.go` and `Config.UpdateProviderKeyTokens`
+</Accordion>
+
+<Accordion title="Dead Refresh Token Is Permanent">
+**Severity**: Medium
+**Behavior**: A `401` from the refresh endpoint, or code `12153` in an HTTP-200 body, is treated as a permanent credential fault
+**Impact**: The request fails instead of being retried or falling back, and the key must be re-authenticated; this is deliberate, since a fallback would hide a dead key behind traffic billed elsewhere
+**Code**: `parseError` in `core/providers/codebuddycn/errors.go`; `deadRefreshTokenError` in `core/providers/utils/tokencache/browserlogin.go`
+</Accordion>
+
+<Accordion title="Static Model Catalog">
+**Severity**: Low
+**Behavior**: List Models answers from the pinned catalog (`hunyuan-chat`, `deepseek-v3`, `glm-5.2`) when the live listing is unavailable
+**Impact**: The picker can lag behind the models Tencent adds; chat requests are unaffected because unknown ids pass through
+**Code**: `codeBuddyCatalog` and `catalogListModelsResponse` in `core/providers/codebuddycn/models.go`
+</Accordion>
+
+<Accordion title="Login Requires an Admin Session">
+**Severity**: Medium
+**Behavior**: Both login handlers refuse a deployment whose dashboard authentication is disabled or unconfigured with `403`, and the management middleware rejects a request that carries no admin session; the login is never an unauthenticated endpoint
+**Impact**: Browser login is an operator action; it cannot be used as a per-end-user sign-in, and one credential set per key is shared by all gateway traffic
+**Code**: `startCodeBuddyLogin` and `pollCodeBuddyLogin` in `transports/bifrost-http/handlers/codebuddylogin.go`
+</Accordion>
+
+<Accordion title="Editor Identity Headers">
+**Severity**: Low
+**Behavior**: `X-Product`, `X-IDE-Type`, `X-IDE-Name` and `X-IDE-Version` are sent on every inference call
+**Impact**: The values come from Tencent's CLI rather than a published contract and may need updating when CodeBuddy ships a release that changes them. They take priority over `network_config.extra_headers`; a per-request context header is the only way to send a different value
+**Code**: `mergeExtraHeaders` and `editorHeaders` in `core/providers/codebuddycn/headers.go`
+</Accordion>

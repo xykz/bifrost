@@ -533,6 +533,154 @@ provider-key-by-id:
       '500':
         $ref: '../../openapi.yaml#/components/responses/InternalError'
 
+codebuddy-login-start:
+  post:
+    operationId: startCodeBuddyLogin
+    x-mint:
+      content: |
+        **Required Permissions**
+
+        | Permission | Granted via |
+        | --- | --- |
+        | Authenticated dashboard session | Dashboard login |
+
+        [How permissions work](/api/procuring-api-keys#required-permissions)
+    summary: Start a CodeBuddy CN browser login
+    description: |
+      Opens an interactive sign-in at the provider's own gateway and returns an opaque flow
+      handle to poll. The administrator opens `auth_url` in a browser; the tokens are handed
+      back by the poll endpoint once the browser finishes.
+
+      The login is an **admin** action, not a per-end-user sign-in: the resulting token pair is
+      stored on a key and shared by every request that key serves. Both this endpoint and its
+      poll require an authenticated admin session; on a deployment whose dashboard
+      authentication is disabled or unconfigured they refuse with `403` rather than minting a
+      credential for anyone on the network.
+
+      The request body is ignored. The upstream host comes only from the provider's
+      `network_config.base_url`, falling back to `https://copilot.tencent.com`, so this endpoint
+      cannot be used to forward a request to an arbitrary host.
+    tags:
+      - Providers
+    parameters:
+      - name: provider
+        in: path
+        required: true
+        description: Provider name. Must resolve to a codebuddy-cn implementation.
+        schema:
+          type: string
+    security:
+      - ManagementBearerAuth: []
+      - BasicAuth: []
+    responses:
+      '200':
+        description: Login started
+        content:
+          application/json:
+            schema:
+              $ref: '../../schemas/management/providers.yaml#/CodeBuddyLoginStartResponse'
+      '400':
+        description: The provider does not resolve to codebuddy-cn
+        content:
+          application/json:
+            schema:
+              $ref: '../../schemas/inference/common.yaml#/BifrostError'
+      '403':
+        description: No authenticated admin session (dashboard authentication disabled or unconfigured)
+        content:
+          application/json:
+            schema:
+              $ref: '../../schemas/inference/common.yaml#/BifrostError'
+      '404':
+        description: Provider not found
+        content:
+          application/json:
+            schema:
+              $ref: '../../schemas/inference/common.yaml#/BifrostError'
+      '500':
+        $ref: '../../openapi.yaml#/components/responses/InternalError'
+      '502':
+        description: The upstream gateway could not be reached or answered with an unexpected body
+        content:
+          application/json:
+            schema:
+              $ref: '../../schemas/inference/common.yaml#/BifrostError'
+
+codebuddy-login-poll:
+  get:
+    operationId: pollCodeBuddyLogin
+    x-mint:
+      content: |
+        **Required Permissions**
+
+        | Permission | Granted via |
+        | --- | --- |
+        | Authenticated dashboard session | Dashboard login |
+
+        [How permissions work](/api/procuring-api-keys#required-permissions)
+    summary: Poll a CodeBuddy CN browser login
+    description: |
+      Returns the state of a sign-in started by the start endpoint. Poll until `status` is
+      `completed` or `failed`; a settled flow is returned verbatim for five minutes without
+      contacting the upstream again, so repeating a poll is free.
+
+      `expires_at` on a completed flow is the **access token's** expiry, not the flow deadline
+      (that is `flow_expires_at` on the start response). A flow that expires before the browser
+      finishes, or one belonging to a different provider, answers `404`.
+
+      Requires an authenticated admin session; without one this returns `403`.
+    tags:
+      - Providers
+    parameters:
+      - name: provider
+        in: path
+        required: true
+        description: Provider name. Must resolve to a codebuddy-cn implementation.
+        schema:
+          type: string
+      - name: flow_id
+        in: path
+        required: true
+        description: The `flow_id` returned by the start endpoint
+        schema:
+          type: string
+    security:
+      - ManagementBearerAuth: []
+      - BasicAuth: []
+    responses:
+      '200':
+        description: Current state of the flow
+        content:
+          application/json:
+            schema:
+              $ref: '../../schemas/management/providers.yaml#/CodeBuddyLoginStatusResponse'
+      '400':
+        description: The provider does not resolve to codebuddy-cn, or the flow id is missing
+        content:
+          application/json:
+            schema:
+              $ref: '../../schemas/inference/common.yaml#/BifrostError'
+      '403':
+        description: No authenticated admin session (dashboard authentication disabled or unconfigured)
+        content:
+          application/json:
+            schema:
+              $ref: '../../schemas/inference/common.yaml#/BifrostError'
+      '404':
+        description: Provider not found, or the flow is unknown, expired or settled elsewhere
+        content:
+          application/json:
+            schema:
+              $ref: '../../schemas/inference/common.yaml#/BifrostError'
+      '500':
+        $ref: '../../openapi.yaml#/components/responses/InternalError'
+      '502':
+        description: The upstream gateway could not be reached
+        content:
+          application/json:
+            schema:
+              $ref: '../../schemas/inference/common.yaml#/BifrostError'
+
 keys:
   get:
     operationId: listKeys

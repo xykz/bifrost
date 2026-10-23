@@ -2869,6 +2869,50 @@
                       }
                     }
                   ]
+                },
+                {
+                  "name": "CodeBuddy CN (1 latest)",
+                  "item": [
+                    {
+                      "name": "codebuddy-cn/hunyuan-chat",
+                      "request": {
+                        "method": "POST",
+                        "header": [
+                          {
+                            "key": "Content-Type",
+                            "value": "application/json"
+                          }
+                        ],
+                        "body": {
+                          "mode": "raw",
+                          "raw": "{\n  \"model\": \"codebuddy-cn/hunyuan-chat\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Hello\"\n    }\n  ]\n}"
+                        },
+                        "url": {
+                          "raw": "{{baseUrl}}/v1/chat/completions",
+                          "host": [
+                            "{{baseUrl}}"
+                          ],
+                          "path": [
+                            "v1",
+                            "chat",
+                            "completions"
+                          ]
+                        }
+                      },
+                      "event": [
+                        {
+                          "listen": "test",
+                          "script": {
+                            "type": "text/javascript",
+                            "exec": [
+                              "pm.test('codebuddy-cn chat non-streaming returns 200', function () { pm.expect(pm.response.code, pm.response.text()).to.eql(200); });",
+                              "pm.test('codebuddy-cn chat non-streaming has content', function () { var j = pm.response.json(); var msg = j.choices && j.choices[0] && j.choices[0].message; pm.expect((msg && msg.content) || '', pm.response.text()).to.be.a('string').and.not.empty; });"
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  ]
                 }
               ]
             },
@@ -5237,6 +5281,46 @@
                       ]
                     }
                   }
+                },
+                {
+                  "name": "codebuddy-cn/hunyuan-chat",
+                  "request": {
+                    "method": "POST",
+                    "header": [
+                      {
+                        "key": "Content-Type",
+                        "value": "application/json"
+                      }
+                    ],
+                    "body": {
+                      "mode": "raw",
+                      "raw": "{\n  \"model\": \"codebuddy-cn/hunyuan-chat\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Hello\"\n    }\n  ],\n  \"stream\": true\n}"
+                    },
+                    "url": {
+                      "raw": "{{baseUrl}}/v1/chat/completions",
+                      "host": [
+                        "{{baseUrl}}"
+                      ],
+                      "path": [
+                        "v1",
+                        "chat",
+                        "completions"
+                      ]
+                    }
+                  },
+                  "event": [
+                    {
+                      "listen": "test",
+                      "script": {
+                        "type": "text/javascript",
+                        "exec": [
+                          "pm.test('codebuddy-cn chat streaming returns 200', function () { pm.expect(pm.response.code, pm.response.text()).to.eql(200); });",
+                          "pm.test('codebuddy-cn chat streaming is SSE', function () { var ct = pm.response.headers.get('content-type') || ''; pm.expect(ct, 'expected SSE, got ' + ct).to.include('event-stream'); });",
+                          "pm.test('codebuddy-cn chat streaming has a delta', function () { var body = pm.response.text() || ''; var hasDelta = /\"delta\"\\s*:/.test(body); pm.expect(hasDelta, pm.response.text()).to.be.true; });"
+                        ]
+                      }
+                    }
+                  ]
                 }
               ]
             },

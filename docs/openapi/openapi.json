@@ -43731,6 +43731,203 @@
         }
       }
     },
+    "/api/providers/{provider}/codebuddy-cn/login": {
+      "post": {
+        "operationId": "startCodeBuddyLogin",
+        "x-mint": {
+          "content": "**Required Permissions**\n\n| Permission | Granted via |\n| --- | --- |\n| Authenticated dashboard session | Dashboard login |\n\n[How permissions work](/api/procuring-api-keys#required-permissions)\n"
+        },
+        "summary": "Start a CodeBuddy CN browser login",
+        "description": "Opens an interactive sign-in at the provider's own gateway and returns an opaque flow\nhandle to poll. The administrator opens `auth_url` in a browser; the tokens are handed\nback by the poll endpoint once the browser finishes.\n\nThe login is an **admin** action, not a per-end-user sign-in: the resulting token pair is\nstored on a key and shared by every request that key serves. Both this endpoint and its\npoll require an authenticated admin session; on a deployment whose dashboard\nauthentication is disabled or unconfigured they refuse with `403` rather than minting a\ncredential for anyone on the network.\n\nThe request body is ignored. The upstream host comes only from the provider's\n`network_config.base_url`, falling back to `https://copilot.tencent.com`, so this endpoint\ncannot be used to forward a request to an arbitrary host.\n",
+        "tags": [
+          "Providers"
+        ],
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "required": true,
+            "description": "Provider name. Must resolve to a codebuddy-cn implementation.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "ManagementBearerAuth": []
+          },
+          {
+            "BasicAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Login started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CodeBuddyLoginStartResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The provider does not resolve to codebuddy-cn",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "No authenticated admin session (dashboard authentication disabled or unconfigured)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Provider not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The upstream gateway could not be reached or answered with an unexpected body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/providers/{provider}/codebuddy-cn/login/{flow_id}": {
+      "get": {
+        "operationId": "pollCodeBuddyLogin",
+        "x-mint": {
+          "content": "**Required Permissions**\n\n| Permission | Granted via |\n| --- | --- |\n| Authenticated dashboard session | Dashboard login |\n\n[How permissions work](/api/procuring-api-keys#required-permissions)\n"
+        },
+        "summary": "Poll a CodeBuddy CN browser login",
+        "description": "Returns the state of a sign-in started by the start endpoint. Poll until `status` is\n`completed` or `failed`; a settled flow is returned verbatim for five minutes without\ncontacting the upstream again, so repeating a poll is free.\n\n`expires_at` on a completed flow is the **access token's** expiry, not the flow deadline\n(that is `flow_expires_at` on the start response). A flow that expires before the browser\nfinishes, or one belonging to a different provider, answers `404`.\n\nRequires an authenticated admin session; without one this returns `403`.\n",
+        "tags": [
+          "Providers"
+        ],
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "required": true,
+            "description": "Provider name. Must resolve to a codebuddy-cn implementation.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "flow_id",
+            "in": "path",
+            "required": true,
+            "description": "The `flow_id` returned by the start endpoint",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "ManagementBearerAuth": []
+          },
+          {
+            "BasicAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current state of the flow",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CodeBuddyLoginStatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The provider does not resolve to codebuddy-cn, or the flow id is missing",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "No authenticated admin session (dashboard authentication disabled or unconfigured)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Provider not found, or the flow is unknown, expired or settled elsewhere",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The upstream gateway could not be reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/keys": {
       "get": {
         "operationId": "listKeys",
@@ -129070,6 +129267,68 @@
           "buffer_size": {
             "type": "integer",
             "description": "Size of the buffer"
+          }
+        }
+      },
+      "CodeBuddyLoginStartResponse": {
+        "type": "object",
+        "description": "A CodeBuddy CN browser login that has been opened upstream.",
+        "required": [
+          "flow_id",
+          "auth_url",
+          "flow_expires_at"
+        ],
+        "properties": {
+          "flow_id": {
+            "type": "string",
+            "description": "Opaque handle to poll with. The upstream state is never exposed."
+          },
+          "auth_url": {
+            "type": "string",
+            "description": "The upstream URL the administrator opens to sign in."
+          },
+          "flow_expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the browser must finish the sign-in. Deliberately not named `expires_at`: the completed poll uses that name for the access token's expiry, and the two must not be confused."
+          }
+        }
+      },
+      "CodeBuddyLoginStatusResponse": {
+        "type": "object",
+        "description": "The state of a CodeBuddy CN browser login. Fields other than `status` are omitted when they do not apply: the token fields appear only on `completed`, `error` only on `failed`.",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "completed",
+              "failed"
+            ]
+          },
+          "access_token": {
+            "type": "string",
+            "description": "Completed only. Short-lived bearer for inference."
+          },
+          "refresh_token": {
+            "type": "string",
+            "description": "Completed only. Durable credential the key stores."
+          },
+          "token_type": {
+            "type": "string",
+            "description": "Completed only, as the upstream reported it (always `Bearer` today)."
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Completed only. The access token's expiry — what the key stores in `oauth_key_config.expires_at`. Not the flow deadline."
+          },
+          "error": {
+            "type": "string",
+            "description": "Failed only. A message the UI can show, never an upstream token or state."
           }
         }
       },

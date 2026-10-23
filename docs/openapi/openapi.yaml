@@ -803,6 +803,10 @@ paths:
     $ref: "./paths/management/providers.yaml#/provider-keys"
   /api/providers/{provider}/keys/{key_id}:
     $ref: "./paths/management/providers.yaml#/provider-key-by-id"
+  /api/providers/{provider}/codebuddy-cn/login:
+    $ref: "./paths/management/providers.yaml#/codebuddy-login-start"
+  /api/providers/{provider}/codebuddy-cn/login/{flow_id}:
+    $ref: "./paths/management/providers.yaml#/codebuddy-login-poll"
   /api/keys:
     $ref: "./paths/management/providers.yaml#/keys"
   /api/models:
@@ -2111,6 +2115,10 @@ components:
       $ref: "./schemas/management/providers.yaml#/NetworkConfig"
     ConcurrencyAndBufferSize:
       $ref: "./schemas/management/providers.yaml#/ConcurrencyAndBufferSize"
+    CodeBuddyLoginStartResponse:
+      $ref: "./schemas/management/providers.yaml#/CodeBuddyLoginStartResponse"
+    CodeBuddyLoginStatusResponse:
+      $ref: "./schemas/management/providers.yaml#/CodeBuddyLoginStatusResponse"
 
     # Plugins
     Plugin:
