@@ -133,6 +133,7 @@ describe("codebuddyCNOAuthComplete", () => {
 		expect(codebuddyCNOAuthComplete(bundle({ refresh_token: literal("") }))).toBe(false);
 	});
 });
+
 // The key form seeds `_auth_type: "api_key"` on mount as the inert placeholder for the API-key
 // tab. The shared schema skips its checks for that value, so completeness must not be fooled by it.
 describe("codebuddyCNOAuthComplete and the inert discriminator", () => {
