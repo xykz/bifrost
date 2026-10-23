@@ -8757,6 +8757,98 @@ func (c *Config) AddProviderKey(ctx context.Context, provider schemas.ModelProvi
 	return nil
 }
 
+// UpdateProviderKeyTokens writes a refreshed browser_login credential onto a stored key without
+// rebuilding the provider. It is the persistence half of refresh-token rotation, and it exists
+// separately from UpdateProviderKey for one reason: UpdateProviderKey ends by calling
+// Bifrost.UpdateProvider, which stops and restarts that provider's worker queue. That is right for
+// an operator saving a key and wrong on the inference path, where a refresh happens.
+//
+// Nothing else needs rebuilding. Keys are read per request — BaseAccount.GetKeysForProvider →
+// Config.GetProviderConfigRaw — so replacing the in-memory key is by itself enough for the next
+// request to see the new token.
+//
+// Only the three rotating fields change: the grant, endpoint and every operator-set field on the
+// key and its config are preserved. A delivery that would change nothing is skipped, so a
+// duplicate rotation is idempotent rather than a redundant row write.
+func (c *Config) UpdateProviderKeyTokens(ctx context.Context, provider schemas.ModelProvider, keyID, accessToken, refreshToken, expiresAt string) error {
+	c.Mu.Lock()
+	defer c.Mu.Unlock()
+
+	existingConfig, exists := c.Providers[provider]
+	if !exists {
+		return ErrNotFound
+	}
+
+	index := slices.IndexFunc(existingConfig.Keys, func(existingKey schemas.Key) bool {
+		return existingKey.ID == keyID
+	})
+	if index == -1 {
+		return ErrNotFound
+	}
+
+	stored := existingConfig.Keys[index]
+	if stored.OAuthKeyConfig == nil {
+		// A rotation can only belong to a key that authenticates with a bundle. The key was
+		// edited to a pasted value while this refresh was in flight; the pasted value wins.
+		return nil
+	}
+	// A write that changes nothing is skipped, which makes a duplicate delivery idempotent
+	// instead of a redundant row write. Every field is compared, not only the refresh token: an
+	// upstream that rotates nothing still mints a new access token, and that must be persisted or
+	// the next request would have to mint again.
+	if existingConfig.Keys[index].OAuthKeyConfig.AccessToken.GetValue() == accessToken &&
+		existingConfig.Keys[index].OAuthKeyConfig.RefreshToken.GetValue() == refreshToken &&
+		(expiresAt == "" || existingConfig.Keys[index].OAuthKeyConfig.ExpiresAt == expiresAt) {
+		return nil
+	}
+
+	updatedKey := stored
+	cfg := *stored.OAuthKeyConfig
+	cfg.AccessToken = schemas.NewSecretVar(accessToken)
+	cfg.RefreshToken = schemas.NewSecretVar(refreshToken)
+	if expiresAt != "" {
+		cfg.ExpiresAt = expiresAt
+	}
+	updatedKey.OAuthKeyConfig = &cfg
+
+	updatedConfig := existingConfig
+	updatedConfig.Keys = append([]schemas.Key(nil), existingConfig.Keys...)
+	updatedConfig.Keys[index] = updatedKey
+
+	if c.ConfigStore != nil && !skipDBUpdate(ctx) {
+		if err := c.ConfigStore.UpdateProviderKey(ctx, provider, keyID, updatedKey); err != nil {
+			if errors.Is(err, configstore.ErrNotFound) {
+				return ErrNotFound
+			}
+			return fmt.Errorf("failed to persist rotated provider key tokens: %w", err)
+		}
+		// The vault store callback rewrites a secret into a vault reference during the DB write,
+		// on the store-side row copy only. Re-read so the in-memory key carries FromVault/VaultRef
+		// instead of the plaintext the caller supplied.
+		storedKey, err := c.ConfigStore.GetProviderKey(ctx, provider, keyID)
+		if err != nil {
+			logger.Error("failed to re-read stored key %s for provider %s after token update: %v", keyID, provider, err)
+			return fmt.Errorf("failed to re-read provider key after token update: %w", err)
+		}
+		updatedConfig.Keys[index] = *storedKey
+	}
+
+	c.Providers[provider] = updatedConfig
+
+	logger.Debug("Persisted rotated credential for key %s of provider: %s", keyID, provider)
+	return nil
+}
+
+// skipDBUpdate reports whether the context asks configuration writes to leave the store alone.
+func skipDBUpdate(ctx context.Context) bool {
+	if v := ctx.Value(schemas.BifrostContextKeySkipDBUpdate); v != nil {
+		if skip, ok := v.(bool); ok {
+			return skip
+		}
+	}
+	return false
+}
+
 // UpdateProviderKey updates a single key on an existing provider configuration.
 func (c *Config) UpdateProviderKey(ctx context.Context, provider schemas.ModelProvider, keyID string, key schemas.Key) error {
 	c.Mu.Lock()

@@ -120,11 +120,20 @@ func mergeExtraHeaders(networkHeaders map[string]schemas.SecretVar) map[string]s
 // reading key.Value and needs no knowledge of OAuth. A pasted key costs two comparisons and no
 // allocation here.
 //
-// The exchange itself is tokencache.ResolveBearerFrom: single-flight, the 60s refresh margin,
-// the negative cache and the dead-token classification are the cache's. A browser_login refresh
-// also rotates the refresh token, and that rotation is dropped on this path because the minter
-// is built with no callback. Wiring a sink that persists it, and the credential's task of doing
-// so without a per-request cost, is task 6's.
+// A browser_login key normally carries the access token a previous refresh minted, together with
+// its expiry. While that token is still outside the refresh margin it is used as-is: the returned
+// key is that token in Value. This is not an optimisation, it is what makes rotation compatible
+// with the cache. tokencache keys a credential by a hash that includes the refresh token, so after
+// a rotation the next request would miss, mint, and rotate again — one refresh per inference
+// request, forever. The stored access token is the one rotation-stable artefact, and the config
+// records when it dies (ExpiresAt), so the freshness decision is two string comparisons.
+//
+// Past the margin, or with no stored token, the exchange is
+// tokencache.ResolveBearerFromWithSink: single-flight, the 60s refresh margin, the negative cache
+// and the dead-token classification stay the cache's. A rotation it sees is delivered to the
+// process-wide sink, which the transport installs to persist it; with no sink installed the
+// rotation is discarded, so a Go SDK caller still resolves but cannot keep one. The closure is
+// created only on that branch, so the pasted-value path above never pays for it.
 //
 // A minted key costs the credential's cache-key hash plus one cache lookup on the warm path;
 // the minter is built only when the token is actually due.
@@ -133,7 +142,11 @@ func (p *CodeBuddyCNProvider) resolveKey(ctx context.Context, key schemas.Key) (
 	if key.OAuthKeyConfig == nil || strings.TrimSpace(key.Value.GetValue()) != "" {
 		return key, nil
 	}
-	headers, bErr := tokencache.ResolveBearerFrom(ctx, p.tokens, *key.OAuthKeyConfig, p.authHTTPClient)
+	if token := storedAccessToken(*key.OAuthKeyConfig); token != "" {
+		key.Value = schemas.SecretVar{Val: token, SecretType: schemas.SecretTypePlainText}
+		return key, nil
+	}
+	headers, bErr := tokencache.ResolveBearerFromWithSink(ctx, p.tokens, *key.OAuthKeyConfig, p.authHTTPClient, p.rotationCallback(key.ID))
 	if bErr != nil {
 		return key, bErr
 	}
@@ -142,6 +155,56 @@ func (p *CodeBuddyCNProvider) resolveKey(ctx context.Context, key schemas.Key) (
 	// otherwise does not.
 	key.Value = schemas.SecretVar{Val: strings.TrimPrefix(headers[authorizationHeader], bearerPrefix), SecretType: schemas.SecretTypePlainText}
 	return key, nil
+}
+
+// storedAccessToken returns the access token recorded on cfg when it is still usable, or "" when
+// there is none, it is inside the refresh margin, or it has no recorded expiry. The margin is
+// tokencache's, so a token the cache would already consider due is not trusted here either.
+//
+// An empty ExpiresAt means "refresh on use" — that is the documented contract of the field — so a
+// token without one is not used. The provider always stamps an expiry when it persists a rotation,
+// so this only costs the first request after a key was hand-written without one.
+func storedAccessToken(cfg schemas.OAuthKeyConfig) string {
+	token := strings.TrimSpace(cfg.AccessToken.GetValue())
+	if token == "" {
+		return ""
+	}
+	expiresAt := strings.TrimSpace(cfg.ExpiresAt)
+	if expiresAt == "" {
+		return ""
+	}
+	deadline, err := time.Parse(time.RFC3339, expiresAt)
+	if err != nil {
+		// An unparseable expiry is a configuration fault the management API refuses; treating it
+		// as stale costs one mint and lets the next successful refresh replace it, whereas
+		// trusting it would pin a token of unknown age.
+		return ""
+	}
+	if time.Now().Add(tokencache.DefaultRefreshMargin).Before(deadline) {
+		return token
+	}
+	return ""
+}
+
+// rotationCallback builds the sink closure for one key, or nil when no sink is installed. It is
+// only called on the OAuth branch, so a non-OAuth request never allocates it.
+//
+// The provider names itself and the key names itself: the sink is process-wide, and it must know
+// which row to write. The expiry is formatted here, once, because that is the shape the config
+// stores and the only clock the sink can trust is the one the minter used.
+func (p *CodeBuddyCNProvider) rotationCallback(keyID string) func(accessToken, refreshToken string, expiresAt time.Time) {
+	if currentCredentialSink() == nil {
+		return nil
+	}
+	return func(accessToken, refreshToken string, expiresAt time.Time) {
+		sink := currentCredentialSink()
+		if sink == nil {
+			// Cleared between this request deciding to persist and the rotation landing. Dropping
+			// the rotation is the honest outcome: nothing is installed to receive it.
+			return
+		}
+		sink(p.GetProviderKey(), keyID, accessToken, refreshToken, expiresAt.UTC().Format(time.RFC3339))
+	}
 }
 
 // extraHeaders returns the editor identity plus the operator's network headers, which the

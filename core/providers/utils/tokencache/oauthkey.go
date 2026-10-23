@@ -37,32 +37,27 @@ func ResolveBearer(ctx context.Context, cache *Cache[string], value string, cfg 
 }
 
 // ResolveBearerFrom is ResolveBearer for a config that is known to exist, taken by value so a
-// provider that derives it per request (Databricks) keeps it on the stack.
+// provider that derives it per request (Databricks) keeps it on the stack. A rotation is discarded;
+// a caller that persists one uses ResolveBearerFromWithSink.
 func ResolveBearerFrom(ctx context.Context, cache *Cache[string], cfg schemas.OAuthKeyConfig, hc *http.Client) (map[string]string, *schemas.BifrostError) {
-	// The minter is built only on the cold path: a warm request pays for the cache key and
-	// the lookup, not for a clientcredentials.Config it will never use.
-	cacheKey, bErr := validateConfig(&cfg)
-	if bErr != nil {
-		return nil, bErr
-	}
-	entry, bErr := cache.Get(ctx, cacheKey, func(ctx context.Context, prev *Entry[string]) (*Entry[string], *schemas.BifrostError) {
-		_, mint, bErr := MinterForConfig(&cfg, hc)
-		if bErr != nil {
-			return nil, bErr
-		}
-		return mint(ctx, prev)
-	})
-	if bErr != nil {
-		return nil, bErr
-	}
-	return map[string]string{"Authorization": "Bearer " + entry.Value}, nil
+	return ResolveBearerFromWithSink(ctx, cache, cfg, hc, nil)
 }
 
 // MinterForConfig validates cfg for its grant and returns the cache key that identifies the
 // credential together with the minter that exchanges it. Validation runs before anything
 // touches the network, and a configuration fault blocks fallbacks: a different provider will
 // not repair this key.
+//
+// A browser_login rotation is discarded here; ResolveBearerFromWithSink is the entry point that
+// keeps one.
 func MinterForConfig(cfg *schemas.OAuthKeyConfig, hc *http.Client) (string, Minter[string], *schemas.BifrostError) {
+	return minterForConfig(cfg, hc, nil)
+}
+
+// minterForConfig is MinterForConfig with a rotation callback for the browser_login grant. The
+// callback is nil everywhere except the persisting entry point, and it is only ever passed to
+// BrowserLoginMinter, so the other grants cannot observe it.
+func minterForConfig(cfg *schemas.OAuthKeyConfig, hc *http.Client, onRotate func(accessToken, refreshToken string, expiresAt time.Time)) (string, Minter[string], *schemas.BifrostError) {
 	cacheKey, bErr := validateConfig(cfg)
 	if bErr != nil {
 		return "", nil, bErr
@@ -108,7 +103,7 @@ func MinterForConfig(cfg *schemas.OAuthKeyConfig, hc *http.Client) (string, Mint
 		}, hc)
 		return cacheKey, mint, nil
 	case schemas.OAuthGrantBrowserLogin:
-		return cacheKey, BrowserLoginMinter(cfg, hc, nil), nil
+		return cacheKey, BrowserLoginMinter(cfg, hc, onRotate), nil
 	default:
 		return "", nil, configurationError("oauth_key_config.grant_type must be client_credentials, jwt_bearer or browser_login")
 	}

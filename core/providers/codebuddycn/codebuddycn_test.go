@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/maximhq/bifrost/core/providers/openai"
 	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
@@ -35,7 +36,7 @@ func (l *testLogger) LogHTTPRequest(schemas.LogLevel, string) schemas.LogEventBu
 	return schemas.NoopLogEvent
 }
 
-func newTestProvider(t *testing.T, serverURL string) *CodeBuddyCNProvider {
+func newTestProvider(t testing.TB, serverURL string) *CodeBuddyCNProvider {
 	t.Helper()
 	// The test file lives in-package to reach editorHeaders and authHeaderFor, so it cannot import
 	// the root bifrost package for NewNoOpLogger: bifrost imports this package, and Go rejects the
@@ -1056,5 +1057,246 @@ func responsesRequest() *schemas.BifrostResponsesRequest {
 			Role:    schemas.Ptr(schemas.ResponsesInputMessageRoleUser),
 			Content: &schemas.ResponsesMessageContent{ContentStr: schemas.Ptr("hi")},
 		}},
+	}
+}
+
+// rotationSink is the shape the transport installs: the provider names itself so one process-wide
+// callback can serve every provider, and the expiry travels as the RFC3339 string the config
+// stores.
+type rotationSink struct {
+	mu        sync.Mutex
+	calls     int
+	provider  schemas.ModelProvider
+	keyID     string
+	access    string
+	refresh   string
+	expiresAt time.Time
+	lastErr   error
+}
+
+func (s *rotationSink) install() func(schemas.ModelProvider, string, string, string, string) {
+	return func(provider schemas.ModelProvider, keyID, accessToken, refreshToken, expiresAt string) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.calls++
+		s.provider, s.keyID, s.access, s.refresh = provider, keyID, accessToken, refreshToken
+		parsed, err := time.Parse(time.RFC3339, expiresAt)
+		s.expiresAt, s.lastErr = parsed, err
+	}
+}
+
+func (s *rotationSink) snapshot() (int, schemas.ModelProvider, string, string, string, time.Time, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls, s.provider, s.keyID, s.access, s.refresh, s.expiresAt, s.lastErr
+}
+
+// TestResolveKeyDeliversRotationToSink pins that a browser_login rotation reaches the persistence
+// callback with the key's identity attached. Without it the rotated refresh token is discarded,
+// and a key whose upstream invalidates the old one dies at the next mint.
+func TestResolveKeyDeliversRotationToSink(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"accessToken":"access-2","refreshToken":"refresh-2","expiresIn":3600}}`))
+	}))
+	defer server.Close()
+
+	sink := &rotationSink{}
+	SetCredentialSink(sink.install())
+	t.Cleanup(func() { SetCredentialSink(nil) })
+
+	p := newTestProvider(t, server.URL)
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	key := schemas.Key{ID: "key-1", OAuthKeyConfig: &schemas.OAuthKeyConfig{
+		GrantType:    schemas.OAuthGrantBrowserLogin,
+		TokenURL:     *schemas.NewSecretVar(server.URL + "/v2/plugin/auth/token/refresh"),
+		RefreshToken: schemas.NewSecretVar("refresh-1"),
+	}}
+
+	resolved, bErr := p.resolveKey(ctx, key)
+	require.Nil(t, bErr)
+	require.Equal(t, "access-2", resolved.Value.GetValue())
+
+	calls, provider, keyID, access, refresh, expiresAt, parseErr := sink.snapshot()
+	require.NoError(t, parseErr, "the sink's expiry must be RFC3339")
+	require.Equal(t, 1, calls)
+	require.Equal(t, schemas.CodeBuddyCN, provider)
+	require.Equal(t, "key-1", keyID)
+	require.Equal(t, "access-2", access)
+	require.Equal(t, "refresh-2", refresh)
+	require.WithinDuration(t, time.Now().Add(time.Hour), expiresAt, 10*time.Second)
+}
+
+// TestResolveKeyWithoutSinkStillResolves pins that persistence is optional: a process that never
+// installs a sink (the Go SDK, say) still mints and returns the access token.
+func TestResolveKeyWithoutSinkStillResolves(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"accessToken":"access-2","refreshToken":"refresh-2","expiresIn":3600}}`))
+	}))
+	defer server.Close()
+
+	SetCredentialSink(nil)
+	p := newTestProvider(t, server.URL)
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	key := schemas.Key{ID: "key-1", OAuthKeyConfig: &schemas.OAuthKeyConfig{
+		GrantType:    schemas.OAuthGrantBrowserLogin,
+		TokenURL:     *schemas.NewSecretVar(server.URL + "/v2/plugin/auth/token/refresh"),
+		RefreshToken: schemas.NewSecretVar("refresh-1"),
+	}}
+
+	resolved, bErr := p.resolveKey(ctx, key)
+	require.Nil(t, bErr)
+	require.Equal(t, "access-2", resolved.Value.GetValue())
+}
+
+// TestResolveKeyReusesThePersistedAccessToken pins the interaction between persistence and the
+// token cache. The cache is keyed by the refresh token, so a rotation changes the cache key and
+// the next request would miss, mint, and rotate again — one refresh per request forever. The
+// stored access token is the rotation-stable answer: while it is still outside the refresh
+// margin it is used as-is, and the cache is untouched.
+func TestResolveKeyReusesThePersistedAccessToken(t *testing.T) {
+	var mu sync.Mutex
+	refreshes := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		refreshes++
+		n := refreshes
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"code":0,"data":{"accessToken":"access-%d","refreshToken":"refresh-%d","expiresIn":3600}}`, n+1, n+1)))
+	}))
+	defer server.Close()
+
+	p := newTestProvider(t, server.URL)
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	key := schemas.Key{ID: "key-1", OAuthKeyConfig: &schemas.OAuthKeyConfig{
+		GrantType:    schemas.OAuthGrantBrowserLogin,
+		TokenURL:     *schemas.NewSecretVar(server.URL + "/v2/plugin/auth/token/refresh"),
+		RefreshToken: schemas.NewSecretVar("refresh-1"),
+	}}
+
+	// First request mints from refresh-1 and reports the rotation.
+	resolved, bErr := p.resolveKey(ctx, key)
+	require.Nil(t, bErr)
+	require.Equal(t, "access-2", resolved.Value.GetValue())
+
+	// The transport persists access-2 / refresh-2; the next request reads that stored key.
+	stored := key
+	cfg := *key.OAuthKeyConfig
+	cfg.AccessToken = schemas.NewSecretVar("access-2")
+	cfg.RefreshToken = schemas.NewSecretVar("refresh-2")
+	cfg.ExpiresAt = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	stored.OAuthKeyConfig = &cfg
+
+	resolved, bErr = p.resolveKey(ctx, stored)
+	require.Nil(t, bErr)
+	require.Equal(t, "access-2", resolved.Value.GetValue())
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, 1, refreshes, "a persisted access token must be reused, not re-minted through a rotated cache key")
+}
+
+// TestResolveKeyRefreshesWhenTheStoredAccessTokenIsStale pins the other half: the fast path is a
+// freshness check, not a cache of its own. A token inside the refresh margin is minted again even
+// though it is present on the key.
+func TestResolveKeyRefreshesWhenTheStoredAccessTokenIsStale(t *testing.T) {
+	var mu sync.Mutex
+	refreshes := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		refreshes++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"accessToken":"access-new","refreshToken":"refresh-2","expiresIn":3600}}`))
+	}))
+	defer server.Close()
+
+	p := newTestProvider(t, server.URL)
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	key := schemas.Key{ID: "key-1", OAuthKeyConfig: &schemas.OAuthKeyConfig{
+		GrantType:    schemas.OAuthGrantBrowserLogin,
+		TokenURL:     *schemas.NewSecretVar(server.URL + "/v2/plugin/auth/token/refresh"),
+		AccessToken:  schemas.NewSecretVar("access-stale"),
+		RefreshToken: schemas.NewSecretVar("refresh-1"),
+		ExpiresAt:    time.Now().Add(30 * time.Second).UTC().Format(time.RFC3339),
+	}}
+
+	resolved, bErr := p.resolveKey(ctx, key)
+	require.Nil(t, bErr)
+	require.Equal(t, "access-new", resolved.Value.GetValue(), "a token inside the refresh margin must be renewed")
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, 1, refreshes)
+}
+
+// BenchmarkResolveKeyPastedValue isolates the no-OAuth fast path: the check the provider adds to
+// every non-browser_login request. It must stay allocation-free.
+func BenchmarkResolveKeyPastedValue(b *testing.B) {
+	p := newTestProvider(b, "")
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	key := schemas.Key{Value: *schemas.NewSecretVar("sk-pasted")}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		benchResolvedKeySink, benchResolveKeyErrSink = p.resolveKey(ctx, key)
+	}
+}
+
+// BenchmarkResolveKeyOAuthWarm measures the per-request cost of a browser_login key whose access
+// token is stored and still fresh: the comparison the fast path adds, plus whatever expiry check
+// decides it. It never reaches the cache, so it is the cost a settled deployment pays.
+func BenchmarkResolveKeyOAuthWarm(b *testing.B) {
+	p := newTestProvider(b, "")
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	key := schemas.Key{ID: "key-1", OAuthKeyConfig: &schemas.OAuthKeyConfig{
+		GrantType:    schemas.OAuthGrantBrowserLogin,
+		TokenURL:     *schemas.NewSecretVar("https://copilot.tencent.com/v2/plugin/auth/token/refresh"),
+		AccessToken:  schemas.NewSecretVar("access-warm"),
+		RefreshToken: schemas.NewSecretVar("refresh-1"),
+		ExpiresAt:    time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339),
+	}}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		benchResolvedKeySink, benchResolveKeyErrSink = p.resolveKey(ctx, key)
+	}
+}
+
+// benchResolvedKeySink and benchResolveKeyErrSink keep the benchmarked result reachable so the
+// compiler cannot eliminate the call and report a fake cost.
+var (
+	benchResolvedKeySink   schemas.Key
+	benchResolveKeyErrSink *schemas.BifrostError
+)
+
+// TestStoredAccessTokenIsOnlyUsedWhenItsExpirySaysSo pins the three rejection cases of the
+// rotation-stable fast path. An empty expiry means "refresh on use" in the config contract, so a
+// token without one must not be trusted; an unparseable one is likewise treated as stale rather
+// than pinning a token of unknown age.
+func TestStoredAccessTokenIsOnlyUsedWhenItsExpirySaysSo(t *testing.T) {
+	future := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	past := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+
+	cases := []struct {
+		name string
+		cfg  schemas.OAuthKeyConfig
+		want string
+	}{
+		{"fresh token", schemas.OAuthKeyConfig{AccessToken: schemas.NewSecretVar("a"), ExpiresAt: future}, "a"},
+		{"no access token", schemas.OAuthKeyConfig{ExpiresAt: future}, ""},
+		{"no expiry means refresh on use", schemas.OAuthKeyConfig{AccessToken: schemas.NewSecretVar("a")}, ""},
+		{"expired", schemas.OAuthKeyConfig{AccessToken: schemas.NewSecretVar("a"), ExpiresAt: past}, ""},
+		{"inside the refresh margin", schemas.OAuthKeyConfig{AccessToken: schemas.NewSecretVar("a"), ExpiresAt: time.Now().Add(30 * time.Second).UTC().Format(time.RFC3339)}, ""},
+		{"unparseable expiry", schemas.OAuthKeyConfig{AccessToken: schemas.NewSecretVar("a"), ExpiresAt: "tomorrow"}, ""},
+		{"whitespace-only token", schemas.OAuthKeyConfig{AccessToken: schemas.NewSecretVar("  "), ExpiresAt: future}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, storedAccessToken(tc.cfg))
+		})
 	}
 }

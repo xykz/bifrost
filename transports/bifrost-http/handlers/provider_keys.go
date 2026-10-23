@@ -764,12 +764,18 @@ func (h *ProviderHandler) mergeUpdatedKey(oldRawKey, updateKey schemas.Key) (sch
 	}
 
 	if mergedKey.OAuthKeyConfig != nil {
-		var tokenURL, clientID, clientSecret, privateKey *schemas.SecretVar
+		var tokenURL, clientID, clientSecret, privateKey, accessToken, refreshToken *schemas.SecretVar
 		if old := oldRawKey.OAuthKeyConfig; old != nil {
 			tokenURL = &old.TokenURL
 			clientID = old.ClientID
 			clientSecret = old.ClientSecret
 			privateKey = old.PrivateKey
+			// browser_login rotates these at runtime, and a GET masks them like every other
+			// credential. Without these two entries an ordinary save (rename, weight edit) that
+			// echoes the mask would overwrite the fresh tokens with asterisks, and the next
+			// refresh would send the mask upstream as the durable credential.
+			accessToken = old.AccessToken
+			refreshToken = old.RefreshToken
 		}
 		for _, item := range []struct {
 			incoming *schemas.SecretVar
@@ -780,6 +786,8 @@ func (h *ProviderHandler) mergeUpdatedKey(oldRawKey, updateKey schemas.Key) (sch
 			{mergedKey.OAuthKeyConfig.ClientID, clientID, "oauth_key_config.client_id"},
 			{mergedKey.OAuthKeyConfig.ClientSecret, clientSecret, "oauth_key_config.client_secret"},
 			{mergedKey.OAuthKeyConfig.PrivateKey, privateKey, "oauth_key_config.private_key"},
+			{mergedKey.OAuthKeyConfig.AccessToken, accessToken, "oauth_key_config.access_token"},
+			{mergedKey.OAuthKeyConfig.RefreshToken, refreshToken, "oauth_key_config.refresh_token"},
 		} {
 			if err := preserve(item.incoming, item.stored, item.field); err != nil {
 				return schemas.Key{}, err
@@ -1096,6 +1104,21 @@ func validateProviderKeyURL(provider schemas.ModelProvider, key schemas.Key) err
 		}
 		if hasClientID != hasClientSecret {
 			return fmt.Errorf("databricks_key_config.client_id and databricks_key_config.client_secret must be set together")
+		}
+	case schemas.CodeBuddyCN:
+		// CodeBuddy has exactly two auth modes and they are mutually exclusive: a pasted API key
+		// travels in X-API-Key, a browser_login access token in Authorization. Accepting both
+		// would persist a key whose configured login is silently unused (resolveKey prefers the
+		// pasted value), and accepting neither leaves a key that can never authenticate.
+		// Whitespace-only counts as empty, matching resolveKey and authHeaderFor.
+		hasValue := strings.TrimSpace(key.Value.GetValue()) != ""
+		if hasValue && key.OAuthKeyConfig != nil {
+			return fmt.Errorf("a codebuddy-cn key takes either a pasted api key or an oauth login, not both")
+		}
+		if !hasValue {
+			if key.OAuthKeyConfig == nil || key.OAuthKeyConfig.GrantType != schemas.OAuthGrantBrowserLogin {
+				return fmt.Errorf("codebuddy-cn key requires either value or oauth_key_config with grant_type browser_login")
+			}
 		}
 	}
 	// oauth_key_config is accepted on any provider's key and must be whole when present: a

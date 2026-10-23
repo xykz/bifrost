@@ -1,22 +1,30 @@
 package handlers
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 
+	bifrost "github.com/maximhq/bifrost/core"
+	"github.com/maximhq/bifrost/core/providers/codebuddycn"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/framework/configstore"
 	"github.com/maximhq/bifrost/transports/v2/bifrost-http/lib"
 	"github.com/valyala/fasthttp"
+	"gorm.io/gorm"
 )
 
 func TestProviderKeyReadRedactsNestedSecrets(t *testing.T) {
@@ -796,13 +804,34 @@ func TestValidateProviderKeyOAuthKeyConfig(t *testing.T) {
 		{"jwt_bearer missing audience", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.Audience = "" })}, "audience is required"},
 		{"jwt_bearer literal key is not a PEM", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.PrivateKey = schemas.NewSecretVar("not a key") })}, "RSA or EC private key"},
 		{"jwt_bearer env-backed key is not shape checked", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.PrivateKey = schemas.NewSecretVar("env.IDP_KEY") })}, ""},
-		{"an EC key under the default RS256 is refused at save", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P256(), false)); c.SigningAlgorithm = "" })}, "signing_algorithm"},
-		{"an RSA key with ES256 is refused at save", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.PrivateKey = schemas.NewSecretVar(pkcs1TestPEM(t)); c.SigningAlgorithm = "ES256" })}, "signing_algorithm"},
-		{"a P-384 key with ES256 is refused at save", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P384(), false)); c.SigningAlgorithm = "ES256" })}, "signing_algorithm"},
-		{"a P-256 key with ES256 is accepted", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P256(), false)); c.SigningAlgorithm = "ES256" })}, ""},
-		{"a P-384 PKCS#8 key with ES384 is accepted", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P384(), true)); c.SigningAlgorithm = "ES384" })}, ""},
-		{"a P-521 key with ES512 is accepted", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P521(), false)); c.SigningAlgorithm = "ES512" })}, ""},
-		{"an RSA key with PS256 is accepted", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.PrivateKey = schemas.NewSecretVar(pkcs8TestPEM(t)); c.SigningAlgorithm = "PS256" })}, ""},
+		{"an EC key under the default RS256 is refused at save", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) {
+			c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P256(), false))
+			c.SigningAlgorithm = ""
+		})}, "signing_algorithm"},
+		{"an RSA key with ES256 is refused at save", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) {
+			c.PrivateKey = schemas.NewSecretVar(pkcs1TestPEM(t))
+			c.SigningAlgorithm = "ES256"
+		})}, "signing_algorithm"},
+		{"a P-384 key with ES256 is refused at save", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) {
+			c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P384(), false))
+			c.SigningAlgorithm = "ES256"
+		})}, "signing_algorithm"},
+		{"a P-256 key with ES256 is accepted", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) {
+			c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P256(), false))
+			c.SigningAlgorithm = "ES256"
+		})}, ""},
+		{"a P-384 PKCS#8 key with ES384 is accepted", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) {
+			c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P384(), true))
+			c.SigningAlgorithm = "ES384"
+		})}, ""},
+		{"a P-521 key with ES512 is accepted", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) {
+			c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P521(), false))
+			c.SigningAlgorithm = "ES512"
+		})}, ""},
+		{"an RSA key with PS256 is accepted", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) {
+			c.PrivateKey = schemas.NewSecretVar(pkcs8TestPEM(t))
+			c.SigningAlgorithm = "PS256"
+		})}, ""},
 		{"a half block behind a value is still refused", schemas.OpenAI, schemas.Key{Value: *schemas.NewSecretVar("sk"), OAuthKeyConfig: cc(func(c *schemas.OAuthKeyConfig) { c.GrantType = "" })}, "grant_type is required"},
 		{"refused on a provider that does not resolve it", schemas.Anthropic, schemas.Key{Value: *schemas.NewSecretVar("sk"), OAuthKeyConfig: cc(nil)}, "only supported on openai"},
 	}
@@ -1921,4 +1950,386 @@ func TestProviderKeyWrites_RejectUnknownOAuthKeyConfigFields(t *testing.T) {
 			t.Fatalf("the stored key must be untouched, got %+v", stored.OAuthKeyConfig)
 		}
 	})
+}
+
+// tokenWriteStore records the key writes the token-persistence path performs. It embeds the
+// interface so a method this path does not touch panics rather than silently returning a zero
+// value, and so the assertions below can only pass on a real store round-trip.
+type tokenWriteStore struct {
+	configstore.ConfigStore
+	keys   map[string]schemas.Key
+	writes int
+}
+
+func newTokenWriteStore(keys ...schemas.Key) *tokenWriteStore {
+	store := &tokenWriteStore{keys: make(map[string]schemas.Key, len(keys))}
+	for _, key := range keys {
+		store.keys[key.ID] = key
+	}
+	return store
+}
+
+func (s *tokenWriteStore) UpdateProviderKey(_ context.Context, _ schemas.ModelProvider, keyID string, key schemas.Key, _ ...*gorm.DB) error {
+	if _, ok := s.keys[keyID]; !ok {
+		return configstore.ErrNotFound
+	}
+	s.keys[keyID] = key
+	s.writes++
+	return nil
+}
+
+func (s *tokenWriteStore) GetProviderKey(_ context.Context, _ schemas.ModelProvider, keyID string) (*schemas.Key, error) {
+	key, ok := s.keys[keyID]
+	if !ok {
+		return nil, configstore.ErrNotFound
+	}
+	return &key, nil
+}
+
+// browserLoginConfig is a complete browser_login bundle. The endpoint is the real CodeBuddy one,
+// which is https and therefore accepted by the management API's token-URL shape check.
+func browserLoginConfig() *schemas.OAuthKeyConfig {
+	return &schemas.OAuthKeyConfig{
+		GrantType:    schemas.OAuthGrantBrowserLogin,
+		TokenURL:     *schemas.NewSecretVar("https://copilot.tencent.com/v2/plugin/auth/token/refresh"),
+		AccessToken:  schemas.NewSecretVar("access-stored"),
+		RefreshToken: schemas.NewSecretVar("refresh-stored"),
+		ExpiresAt:    "2026-10-22T12:00:00Z",
+	}
+}
+
+// TestUpdateProviderKeyResolvesMaskedOAuthTokens pins the write-side guard for the two rotating
+// browser_login fields. A GET masks access_token and refresh_token; the UI echoes those masks on
+// every save. Without the preserve entries the asterisks are stored as the credential, the next
+// refresh sends them upstream, and the key dies permanently.
+func TestUpdateProviderKeyResolvesMaskedOAuthTokens(t *testing.T) {
+	SetLogger(&mockLogger{})
+	lib.SetLogger(&mockLogger{})
+
+	stored := browserLoginConfig()
+	masked := stored.Redacted()
+	h := &ProviderHandler{
+		inMemoryStore: &lib.Config{
+			Providers: map[schemas.ModelProvider]configstore.ProviderConfig{
+				schemas.CodeBuddyCN: {Keys: []schemas.Key{{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: stored}}},
+			},
+		},
+		modelsManager: &mockModelsManager{},
+	}
+	attachBifrostClient(t, h.inMemoryStore)
+
+	body, err := json.Marshal(map[string]any{
+		"name": "cb",
+		"oauth_key_config": map[string]any{
+			"grant_type":    string(schemas.OAuthGrantBrowserLogin),
+			"token_url":     "https://copilot.tencent.com/v2/plugin/auth/token/refresh",
+			"access_token":  masked.AccessToken.GetValue(),
+			"refresh_token": masked.RefreshToken.GetValue(),
+			"expires_at":    "2026-10-22T12:00:00Z",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal body: %v", err)
+	}
+
+	ctx := newTestRequestCtx(string(body))
+	ctx.SetUserValue("provider", string(schemas.CodeBuddyCN))
+	ctx.SetUserValue("key_id", "key-1")
+	h.updateProviderKey(ctx)
+
+	if ctx.Response.StatusCode() != fasthttp.StatusOK {
+		t.Fatalf("status got %d, want 200; body=%s", ctx.Response.StatusCode(), ctx.Response.Body())
+	}
+	got := h.inMemoryStore.Providers[schemas.CodeBuddyCN].Keys[0].OAuthKeyConfig
+	if got.AccessToken.GetValue() != "access-stored" {
+		t.Errorf("stored access token = %q, want the stored credential, not the mask", got.AccessToken.GetValue())
+	}
+	if got.RefreshToken.GetValue() != "refresh-stored" {
+		t.Errorf("stored refresh token = %q, want the stored credential, not the mask", got.RefreshToken.GetValue())
+	}
+}
+
+// TestCodeBuddyCNAllowsEmptyValueWithOAuthBundle pins the OAuth-only key: the credential is the
+// bundle, so an empty value is not a missing credential.
+func TestCodeBuddyCNAllowsEmptyValueWithOAuthBundle(t *testing.T) {
+	SetLogger(&mockLogger{})
+	lib.SetLogger(&mockLogger{})
+
+	h := &ProviderHandler{
+		inMemoryStore: &lib.Config{
+			Providers: map[schemas.ModelProvider]configstore.ProviderConfig{schemas.CodeBuddyCN: {}},
+		},
+		modelsManager: &mockModelsManager{},
+	}
+	attachBifrostClient(t, h.inMemoryStore)
+
+	body, err := json.Marshal(map[string]any{
+		"name": "cb-oauth",
+		"oauth_key_config": map[string]any{
+			"grant_type":    string(schemas.OAuthGrantBrowserLogin),
+			"token_url":     "https://copilot.tencent.com/v2/plugin/auth/token/refresh",
+			"refresh_token": "refresh-1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal body: %v", err)
+	}
+
+	ctx := newTestRequestCtx(string(body))
+	ctx.SetUserValue("provider", string(schemas.CodeBuddyCN))
+	h.createProviderKey(ctx)
+
+	if ctx.Response.StatusCode() != fasthttp.StatusOK {
+		t.Fatalf("an oauth-only key must be accepted, got %d; body=%s", ctx.Response.StatusCode(), ctx.Response.Body())
+	}
+}
+
+// TestCodeBuddyCNRejectsBothAuthModes closes the ambiguity the two credential shapes create: a
+// key carrying both a pasted value and an oauth bundle does not say which one authenticates, and
+// resolveKey would silently prefer the pasted value, leaving the login unused.
+func TestCodeBuddyCNRejectsBothAuthModes(t *testing.T) {
+	SetLogger(&mockLogger{})
+	lib.SetLogger(&mockLogger{})
+
+	h := &ProviderHandler{
+		inMemoryStore: &lib.Config{
+			Providers: map[schemas.ModelProvider]configstore.ProviderConfig{schemas.CodeBuddyCN: {}},
+		},
+		modelsManager: &mockModelsManager{},
+	}
+	attachBifrostClient(t, h.inMemoryStore)
+
+	ctx := newTestRequestCtx(`{"name":"cb-both","value":"sk-pasted","oauth_key_config":{` +
+		`"grant_type":"browser_login",` +
+		`"token_url":"https://copilot.tencent.com/v2/plugin/auth/token/refresh",` +
+		`"refresh_token":"refresh-1"}}`)
+	ctx.SetUserValue("provider", string(schemas.CodeBuddyCN))
+	h.createProviderKey(ctx)
+
+	if ctx.Response.StatusCode() != fasthttp.StatusBadRequest {
+		t.Fatalf("status got %d, want 400; body=%s", ctx.Response.StatusCode(), ctx.Response.Body())
+	}
+	if body := string(ctx.Response.Body()); !strings.Contains(body, "either a pasted api key or an oauth login, not both") {
+		t.Fatalf("the rejection must name the conflict, got %s", body)
+	}
+	if keys := h.inMemoryStore.Providers[schemas.CodeBuddyCN].Keys; len(keys) != 0 {
+		t.Fatalf("a rejected key must not be stored, got %+v", keys)
+	}
+}
+
+// TestCodeBuddyCNRejectsNeitherAuthMode closes the window CanProviderKeyValueBeEmpty opened:
+// codebuddy-cn admits an empty value, but only because the bundle then carries the credential.
+// A key with neither is unusable and must be refused where the operator can fix it.
+func TestCodeBuddyCNRejectsNeitherAuthMode(t *testing.T) {
+	SetLogger(&mockLogger{})
+	lib.SetLogger(&mockLogger{})
+
+	h := &ProviderHandler{
+		inMemoryStore: &lib.Config{
+			Providers: map[schemas.ModelProvider]configstore.ProviderConfig{schemas.CodeBuddyCN: {}},
+		},
+		modelsManager: &mockModelsManager{},
+	}
+	attachBifrostClient(t, h.inMemoryStore)
+
+	ctx := newTestRequestCtx(`{"name":"cb-empty"}`)
+	ctx.SetUserValue("provider", string(schemas.CodeBuddyCN))
+	h.createProviderKey(ctx)
+
+	if ctx.Response.StatusCode() != fasthttp.StatusBadRequest {
+		t.Fatalf("status got %d, want 400; body=%s", ctx.Response.StatusCode(), ctx.Response.Body())
+	}
+	if body := string(ctx.Response.Body()); !strings.Contains(body, "requires either value or oauth_key_config") {
+		t.Fatalf("the rejection must name the missing auth mode, got %s", body)
+	}
+}
+
+// TestUpdateProviderKeyTokensSkipsProviderRebuild pins the difference between an operator editing
+// a key and a routine token refresh. The write must reach the store and the in-memory key, but
+// must not rebuild the provider: that stops and restarts the provider's worker queue, which is
+// wrong on the inference path a refresh runs on.
+func TestUpdateProviderKeyTokensSkipsProviderRebuild(t *testing.T) {
+	SetLogger(&mockLogger{})
+	lib.SetLogger(&mockLogger{})
+
+	store := newTokenWriteStore(schemas.Key{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: browserLoginConfig()})
+	inMemory := &lib.Config{
+		ConfigStore: store,
+		Providers: map[schemas.ModelProvider]configstore.ProviderConfig{
+			schemas.CodeBuddyCN: {Keys: []schemas.Key{{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: browserLoginConfig()}}},
+		},
+	}
+	client := attachBifrostClientReturning(t, inMemory)
+	before := client.GetProviderByKey(schemas.CodeBuddyCN)
+	if before == nil {
+		t.Fatal("codebuddy-cn provider was not constructed")
+	}
+
+	if err := inMemory.UpdateProviderKeyTokens(context.Background(), schemas.CodeBuddyCN, "key-1", "access-2", "refresh-2", "2026-10-22T13:00:00Z"); err != nil {
+		t.Fatalf("UpdateProviderKeyTokens: %v", err)
+	}
+
+	if got := inMemory.Providers[schemas.CodeBuddyCN].Keys[0].OAuthKeyConfig; got.AccessToken.GetValue() != "access-2" || got.RefreshToken.GetValue() != "refresh-2" {
+		t.Fatalf("in-memory key still carries %q/%q, want access-2/refresh-2", got.AccessToken.GetValue(), got.RefreshToken.GetValue())
+	}
+	if store.writes != 1 {
+		t.Fatalf("store writes = %d, want 1", store.writes)
+	}
+	if got := store.keys["key-1"].OAuthKeyConfig; got == nil || got.RefreshToken.GetValue() != "refresh-2" {
+		t.Fatalf("the store must receive the rotation, got %+v", got)
+	}
+	// A refresh must not touch the runtime shape: Bifrost.UpdateProvider swaps the provider
+	// instance wholesale, so the same pointer is the observable proof that no rebuild happened.
+	if after := client.GetProviderByKey(schemas.CodeBuddyCN); after != before {
+		t.Fatal("the provider was rebuilt; a token write must not restart the worker queue")
+	}
+	// Everything else on the struct is preserved: a rotation only rewrites the two tokens and
+	// the expiry, never the grant, endpoint, or operator-set fields.
+	if got := inMemory.Providers[schemas.CodeBuddyCN].Keys[0]; got.Name != "cb" || got.Weight != 1 {
+		t.Fatalf("the rotation clobbered unrelated key fields: %+v", got)
+	}
+}
+
+// attachBifrostClientReturning is attachBifrostClient for tests that need to observe the runtime
+// provider list, which is the only place a provider rebuild becomes visible.
+func attachBifrostClientReturning(t *testing.T, store *lib.Config) *bifrost.Bifrost {
+	t.Helper()
+	client, err := bifrost.Init(context.Background(), schemas.BifrostConfig{
+		Account: lib.NewBaseAccount(store),
+		Logger:  bifrost.NewDefaultLogger(schemas.LogLevelError),
+	})
+	if err != nil {
+		t.Fatalf("failed to init bifrost client: %v", err)
+	}
+	t.Cleanup(client.Shutdown)
+	store.SetBifrostClient(client)
+	return client
+}
+
+// TestUpdateProviderKeyTokensIdempotentAndAccessOnly covers the two guards on the token write that
+// are not about the provider rebuild.
+func TestUpdateProviderKeyTokensIdempotentAndAccessOnly(t *testing.T) {
+	SetLogger(&mockLogger{})
+	lib.SetLogger(&mockLogger{})
+
+	newConfig := func() (*lib.Config, *tokenWriteStore) {
+		store := newTokenWriteStore(schemas.Key{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: browserLoginConfig()})
+		config := &lib.Config{
+			ConfigStore: store,
+			Providers: map[schemas.ModelProvider]configstore.ProviderConfig{
+				schemas.CodeBuddyCN: {Keys: []schemas.Key{{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: browserLoginConfig()}}},
+			},
+		}
+		return config, store
+	}
+
+	t.Run("an identical delivery is not written twice", func(t *testing.T) {
+		config, store := newConfig()
+		for range 2 {
+			if err := config.UpdateProviderKeyTokens(context.Background(), schemas.CodeBuddyCN, "key-1", "access-stored", "refresh-stored", "2026-10-22T12:00:00Z"); err != nil {
+				t.Fatalf("UpdateProviderKeyTokens: %v", err)
+			}
+		}
+		if store.writes != 0 {
+			t.Fatalf("store writes = %d, want 0 for a delivery that changes nothing", store.writes)
+		}
+	})
+
+	t.Run("a new access token is written even when the refresh token did not rotate", func(t *testing.T) {
+		// The upstream may answer a refresh with a fresh access token and no rotated refresh
+		// token. Skipping that write would leave the stored access token stale and force the next
+		// request to mint again.
+		config, store := newConfig()
+		if err := config.UpdateProviderKeyTokens(context.Background(), schemas.CodeBuddyCN, "key-1", "access-2", "refresh-stored", "2026-10-22T13:00:00Z"); err != nil {
+			t.Fatalf("UpdateProviderKeyTokens: %v", err)
+		}
+		if store.writes != 1 {
+			t.Fatalf("store writes = %d, want 1", store.writes)
+		}
+		if got := config.Providers[schemas.CodeBuddyCN].Keys[0].OAuthKeyConfig; got.AccessToken.GetValue() != "access-2" || got.ExpiresAt != "2026-10-22T13:00:00Z" {
+			t.Fatalf("access token/expiry not persisted: %+v", got)
+		}
+		if got := config.Providers[schemas.CodeBuddyCN].Keys[0].OAuthKeyConfig.RefreshToken.GetValue(); got != "refresh-stored" {
+			t.Fatalf("refresh token = %q, want the unrotated one", got)
+		}
+	})
+
+	t.Run("an unknown key is reported, not silently ignored", func(t *testing.T) {
+		config, _ := newConfig()
+		err := config.UpdateProviderKeyTokens(context.Background(), schemas.CodeBuddyCN, "key-missing", "a", "r", "")
+		if !errors.Is(err, lib.ErrNotFound) {
+			t.Fatalf("err = %v, want ErrNotFound", err)
+		}
+	})
+}
+
+// TestInstallCodeBuddyCredentialSinkPersistsARotation pins the wiring end to end: a real provider
+// refresh invokes the sink this function installs, and the rotation lands in the config store.
+// Driving persistRotatedCredential directly would leave the installation itself untested.
+func TestInstallCodeBuddyCredentialSinkPersistsARotation(t *testing.T) {
+	SetLogger(&mockLogger{})
+	lib.SetLogger(&mockLogger{})
+	t.Cleanup(func() { codebuddycn.SetCredentialSink(nil) })
+
+	var refreshCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v2/plugin/auth/token/refresh":
+			refreshCalls++
+			_, _ = w.Write([]byte(`{"code":0,"data":{"accessToken":"access-2","refreshToken":"refresh-2","expiresIn":3600}}`))
+		default:
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`))
+		}
+	}))
+	defer server.Close()
+
+	store := newTokenWriteStore(schemas.Key{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: browserLoginConfig()})
+	config := &lib.Config{
+		ConfigStore: store,
+		Providers: map[schemas.ModelProvider]configstore.ProviderConfig{
+			schemas.CodeBuddyCN: {Keys: []schemas.Key{{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: browserLoginConfig()}}},
+		},
+	}
+	InstallCodeBuddyCredentialSink(config)
+
+	provider, err := codebuddycn.NewCodeBuddyCNProvider(&schemas.ProviderConfig{
+		NetworkConfig: schemas.NetworkConfig{
+			BaseURL:                        server.URL,
+			AllowPrivateNetwork:            true,
+			DefaultRequestTimeoutInSeconds: 10,
+		},
+	}, &mockLogger{})
+	if err != nil {
+		t.Fatalf("new provider: %v", err)
+	}
+
+	key := config.Providers[schemas.CodeBuddyCN].Keys[0]
+	key.OAuthKeyConfig.TokenURL = *schemas.NewSecretVar(server.URL + "/v2/plugin/auth/token/refresh")
+	key.OAuthKeyConfig.RefreshToken = schemas.NewSecretVar("refresh-1")
+
+	_, bErr := provider.ChatCompletion(schemas.NewBifrostContext(context.Background(), schemas.NoDeadline), key, &schemas.BifrostChatRequest{
+		Provider: schemas.CodeBuddyCN,
+		Model:    "m",
+		Input: []schemas.ChatMessage{{
+			Role:    schemas.ChatMessageRoleUser,
+			Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("hi")},
+		}},
+	})
+	if bErr != nil {
+		t.Fatalf("ChatCompletion: %v", bErr)
+	}
+	if refreshCalls != 1 {
+		t.Fatalf("refresh calls = %d, want 1", refreshCalls)
+	}
+
+	if got := config.Providers[schemas.CodeBuddyCN].Keys[0].OAuthKeyConfig; got.RefreshToken.GetValue() != "refresh-2" {
+		t.Fatalf("refresh token = %q, want refresh-2", got.RefreshToken.GetValue())
+	}
+	if store.writes != 1 {
+		t.Fatalf("store writes = %d, want 1", store.writes)
+	}
+	if got := store.keys["key-1"].OAuthKeyConfig; got.AccessToken.GetValue() != "access-2" {
+		t.Fatalf("store did not receive the rotation: %+v", got)
+	}
 }

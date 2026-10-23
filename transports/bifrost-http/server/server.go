@@ -2938,6 +2938,10 @@ func (s *BifrostHTTPServer) RegisterAPIRoutes(ctx context.Context, callbacks Ser
 	// lib.ChainMiddlewares chains multiple middlewares together
 	healthHandler := handlers.NewHealthHandler(s.Config)
 	providerHandler := handlers.NewProviderHandler(callbacks, s.Config, s.Client)
+	// The CodeBuddy credential sink is process-wide and needs the config store, so it is installed
+	// here, once, where the provider handler that exposes the key routes is built. Without it a
+	// browser_login refresh would discard the rotated refresh token.
+	handlers.InstallCodeBuddyCredentialSink(s.Config)
 	oauthHandler := handlers.NewOAuthHandler(s.Config.OAuthProvider, s.Client, s.Config)
 	mcpHandler := handlers.NewMCPHandler(callbacks, callbacks, s.Client, s.Config, oauthHandler, callbacks)
 	// Virtual MCP routes read the config store on every call; skip them when persistence is disabled
