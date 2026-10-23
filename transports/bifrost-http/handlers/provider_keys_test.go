@@ -806,34 +806,13 @@ func TestValidateProviderKeyOAuthKeyConfig(t *testing.T) {
 		{"jwt_bearer missing audience", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.Audience = "" })}, "audience is required"},
 		{"jwt_bearer literal key is not a PEM", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.PrivateKey = schemas.NewSecretVar("not a key") })}, "RSA or EC private key"},
 		{"jwt_bearer env-backed key is not shape checked", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.PrivateKey = schemas.NewSecretVar("env.IDP_KEY") })}, ""},
-		{"an EC key under the default RS256 is refused at save", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) {
-			c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P256(), false))
-			c.SigningAlgorithm = ""
-		})}, "signing_algorithm"},
-		{"an RSA key with ES256 is refused at save", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) {
-			c.PrivateKey = schemas.NewSecretVar(pkcs1TestPEM(t))
-			c.SigningAlgorithm = "ES256"
-		})}, "signing_algorithm"},
-		{"a P-384 key with ES256 is refused at save", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) {
-			c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P384(), false))
-			c.SigningAlgorithm = "ES256"
-		})}, "signing_algorithm"},
-		{"a P-256 key with ES256 is accepted", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) {
-			c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P256(), false))
-			c.SigningAlgorithm = "ES256"
-		})}, ""},
-		{"a P-384 PKCS#8 key with ES384 is accepted", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) {
-			c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P384(), true))
-			c.SigningAlgorithm = "ES384"
-		})}, ""},
-		{"a P-521 key with ES512 is accepted", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) {
-			c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P521(), false))
-			c.SigningAlgorithm = "ES512"
-		})}, ""},
-		{"an RSA key with PS256 is accepted", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) {
-			c.PrivateKey = schemas.NewSecretVar(pkcs8TestPEM(t))
-			c.SigningAlgorithm = "PS256"
-		})}, ""},
+		{"an EC key under the default RS256 is refused at save", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P256(), false)); c.SigningAlgorithm = "" })}, "signing_algorithm"},
+		{"an RSA key with ES256 is refused at save", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.PrivateKey = schemas.NewSecretVar(pkcs1TestPEM(t)); c.SigningAlgorithm = "ES256" })}, "signing_algorithm"},
+		{"a P-384 key with ES256 is refused at save", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P384(), false)); c.SigningAlgorithm = "ES256" })}, "signing_algorithm"},
+		{"a P-256 key with ES256 is accepted", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P256(), false)); c.SigningAlgorithm = "ES256" })}, ""},
+		{"a P-384 PKCS#8 key with ES384 is accepted", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P384(), true)); c.SigningAlgorithm = "ES384" })}, ""},
+		{"a P-521 key with ES512 is accepted", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.PrivateKey = schemas.NewSecretVar(ecCurveTestPEM(t, elliptic.P521(), false)); c.SigningAlgorithm = "ES512" })}, ""},
+		{"an RSA key with PS256 is accepted", schemas.OpenAI, schemas.Key{OAuthKeyConfig: jb(func(c *schemas.OAuthKeyConfig) { c.PrivateKey = schemas.NewSecretVar(pkcs8TestPEM(t)); c.SigningAlgorithm = "PS256" })}, ""},
 		{"a half block behind a value is still refused", schemas.OpenAI, schemas.Key{Value: *schemas.NewSecretVar("sk"), OAuthKeyConfig: cc(func(c *schemas.OAuthKeyConfig) { c.GrantType = "" })}, "grant_type is required"},
 		{"refused on a provider that does not resolve it", schemas.Anthropic, schemas.Key{Value: *schemas.NewSecretVar("sk"), OAuthKeyConfig: cc(nil)}, "only supported on openai"},
 	}
@@ -2866,6 +2845,128 @@ func TestMaskedTokensWithNothingStoredAreRefused(t *testing.T) {
 	}
 	if got := storedProviderKey(t, config, "key-1").OAuthKeyConfig; got != nil {
 		t.Fatalf("the refused save still mutated the key: %+v", got)
+	}
+}
+
+// TestConcurrentClearThenEchoedSaveDoesNotPanic reproduces the panic window the echo rule opens:
+// request A reads the key, request B clears the OAuth block, then A writes back the pair it read.
+// With `stored` nil and a non-nil read snapshot, an echo branch that copied "the stored values" would
+// dereference nil.
+//
+// The save completes and the resolved block is written: a write that reaches the store last wins, so
+// A's echoed block replaces the clear. The result is a structurally valid browser_login key (the
+// echoed pair, no pasted value) rather than a panic or a half-filled block. That the clear loses is a
+// trade-off of the prescribed rule and is recorded in the report; the invariant under test here is
+// that there is no nil dereference in the window.
+func TestConcurrentClearThenEchoedSaveDoesNotPanic(t *testing.T) {
+	SetLogger(&mockLogger{})
+	lib.SetLogger(&mockLogger{})
+
+	store := newTokenWriteStore(schemas.Key{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: browserLoginConfig()})
+	config := &lib.Config{
+		ConfigStore: store,
+		Providers: map[schemas.ModelProvider]configstore.ProviderConfig{
+			schemas.CodeBuddyCN: {Keys: []schemas.Key{{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: browserLoginConfig()}}},
+		},
+	}
+	attachBifrostClient(t, config)
+
+	// Request A's read.
+	readTime, err := config.GetProviderKeyRaw(schemas.CodeBuddyCN, "key-1")
+	if err != nil {
+		t.Fatalf("GetProviderKeyRaw: %v", err)
+	}
+
+	// Request B clears the OAuth block.
+	if err := config.UpdateProviderKey(context.Background(), schemas.CodeBuddyCN, "key-1", schemas.Key{
+		ID: "key-1", Name: "cb", Weight: 1, Value: *schemas.NewSecretVar("sk-pasted"),
+	}); err != nil {
+		t.Fatalf("clearing update: %v", err)
+	}
+	if got := storedProviderKey(t, config, "key-1").OAuthKeyConfig; got != nil {
+		t.Fatalf("test setup: the block should be cleared, got %+v", got)
+	}
+
+	// Request A writes back the pair it read, unchanged.
+	echo := *readTime.OAuthKeyConfig
+	var err2 error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("the echoed save panicked with the block cleared: %v", r)
+			}
+		}()
+		err2 = config.UpdateProviderKeyWithReadTokens(context.Background(), schemas.CodeBuddyCN, "key-1", schemas.Key{
+			ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: &echo,
+		}, readTime.OAuthKeyConfig)
+	}()
+	if err2 != nil {
+		t.Fatalf("UpdateProviderKeyWithReadTokens: %v", err2)
+	}
+
+	// The echoed block is written, and it is a complete one — not a half-filled block and not a key
+	// carrying both auth modes.
+	stored := storedProviderKey(t, config, "key-1")
+	if stored.OAuthKeyConfig == nil {
+		t.Fatal("the echoed save left no oauth block behind")
+	}
+	if got := stored.OAuthKeyConfig.RefreshToken.GetValue(); got != "refresh-stored" {
+		t.Fatalf("refresh token = %q, want the echoed value", got)
+	}
+	if got := stored.Value.GetValue(); got != "" {
+		t.Fatalf("pasted value = %q, want empty so the key has exactly one auth mode", got)
+	}
+	if err := stored.OAuthKeyConfig.Validate(); err != nil {
+		t.Fatalf("the persisted block is not usable: %v", err)
+	}
+}
+
+// TestConcurrentClearThenEchoedSaveKeepsItsOwnNewTokens pins the other side of the same window: the
+// clear is in the way, but the save carries a genuinely new pair, so it must still be written.
+func TestConcurrentClearThenEchoedSaveKeepsItsOwnNewTokens(t *testing.T) {
+	SetLogger(&mockLogger{})
+	lib.SetLogger(&mockLogger{})
+
+	store := newTokenWriteStore(schemas.Key{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: browserLoginConfig()})
+	config := &lib.Config{
+		ConfigStore: store,
+		Providers: map[schemas.ModelProvider]configstore.ProviderConfig{
+			schemas.CodeBuddyCN: {Keys: []schemas.Key{{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: browserLoginConfig()}}},
+		},
+	}
+	attachBifrostClient(t, config)
+
+	readTime, err := config.GetProviderKeyRaw(schemas.CodeBuddyCN, "key-1")
+	if err != nil {
+		t.Fatalf("GetProviderKeyRaw: %v", err)
+	}
+	if err := config.UpdateProviderKey(context.Background(), schemas.CodeBuddyCN, "key-1", schemas.Key{
+		ID: "key-1", Name: "cb", Weight: 1, Value: *schemas.NewSecretVar("sk-pasted"),
+	}); err != nil {
+		t.Fatalf("clearing update: %v", err)
+	}
+
+	login := browserLoginConfig()
+	login.AccessToken = schemas.NewSecretVar("access-login")
+	login.RefreshToken = schemas.NewSecretVar("refresh-login")
+	var err2 error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("the save panicked with the block cleared: %v", r)
+			}
+		}()
+		err2 = config.UpdateProviderKeyWithReadTokens(context.Background(), schemas.CodeBuddyCN, "key-1", schemas.Key{
+			ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: login,
+		}, readTime.OAuthKeyConfig)
+	}()
+	if err2 != nil {
+		t.Fatalf("UpdateProviderKeyWithReadTokens: %v", err2)
+	}
+
+	got := storedProviderKey(t, config, "key-1").OAuthKeyConfig
+	if got == nil || got.RefreshToken.GetValue() != "refresh-login" {
+		t.Fatalf("a fresh login was dropped because the block had been cleared: %+v", got)
 	}
 }
 

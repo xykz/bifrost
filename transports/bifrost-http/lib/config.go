@@ -9047,6 +9047,13 @@ func operatorOAuthKeyConfig(incoming, stored, readTokens *schemas.OAuthKeyConfig
 	}
 	if tokenUnchanged(access, accessFromStored, readTokens.AccessToken) &&
 		tokenUnchanged(refresh, refreshFromStored, readTokens.RefreshToken) {
+		// An echo keeps whatever is stored *now* — but only if something is. If the block was
+		// cleared between this request's read and this write, `stored` is nil and there is nothing
+		// to copy; the resolved block built above is returned as-is. Dereferencing `stored` here
+		// would panic in exactly the concurrent-write window this rule exists to make safe.
+		if stored == nil {
+			return &cfg, nil
+		}
 		cfg.AccessToken = stored.AccessToken
 		cfg.RefreshToken = stored.RefreshToken
 		cfg.ExpiresAt = stored.ExpiresAt
@@ -9080,9 +9087,15 @@ func tokenUnchanged(effective *schemas.SecretVar, fromStored bool, read *schemas
 	return effective.GetValue() == read.GetValue()
 }
 
-// UpdateProviderKey updates a single key on an existing provider configuration. The incoming key's
-// rotating OAuth tokens are authoritative: use this when the caller is the source of the credential
-// rather than echoing one it read earlier.
+// UpdateProviderKey updates a single key on an existing provider configuration, for callers that did
+// not read the key first and therefore have no echo to guard against.
+//
+// The incoming rotating tokens are still resolved against what is stored before they are written: a
+// masked placeholder or an absent field keeps the stored value rather than overwriting it, so a
+// caller can never persist a redaction by accident. A mask with nothing stored behind it is refused
+// with ErrInvalidKeyCredential, and the expiry follows the tokens as described on
+// operatorOAuthKeyConfig. Without a read snapshot there is no echo to detect, so any literal the
+// caller supplies is written through.
 func (c *Config) UpdateProviderKey(ctx context.Context, provider schemas.ModelProvider, keyID string, key schemas.Key) error {
 	return c.updateProviderKey(ctx, provider, keyID, key, nil)
 }
