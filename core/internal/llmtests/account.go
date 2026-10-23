@@ -207,6 +207,7 @@ func (account *ComprehensiveTestAccount) GetConfiguredProviders() ([]schemas.Mod
 		schemas.Cloudflare,
 		schemas.GithubCopilot,
 		schemas.Typesafe,
+		schemas.CodeBuddyCN,
 		ProviderOpenAICustom,
 	}, nil
 }
@@ -634,6 +635,18 @@ func (account *ComprehensiveTestAccount) GetKeysForProvider(ctx context.Context,
 				UseForBatchAPI: bifrost.Ptr(true),
 			},
 		}, nil
+	case schemas.CodeBuddyCN:
+		// A pasted key goes in X-API-Key, which the provider derives from the value; no
+		// OAuthKeyConfig is set, so the suite exercises the credential an operator configures
+		// most often. The browser_login grant has its own coverage in the provider's unit tests.
+		return []schemas.Key{
+			{
+				Value:          *schemas.NewSecretVar("env.CODEBUDDY_CN_API_KEY"),
+				Models:         []string{"*"},
+				Weight:         1.0,
+				UseForBatchAPI: bifrost.Ptr(false),
+			},
+		}, nil
 	case schemas.Fireworks:
 		return []schemas.Key{
 			{
@@ -987,6 +1000,21 @@ func (account *ComprehensiveTestAccount) GetConfigForProvider(providerKey schema
 			},
 		}, nil
 	case schemas.GithubCopilot:
+		return &schemas.ProviderConfig{
+			NetworkConfig: schemas.NetworkConfig{
+				DefaultRequestTimeoutInSeconds: 120,
+				MaxRetries:                     10,
+				RetryBackoffInitial:            5 * time.Second,
+				RetryBackoffMax:                3 * time.Minute,
+			},
+			ConcurrencyAndBufferSize: schemas.ConcurrencyAndBufferSize{
+				Concurrency: Concurrency,
+				BufferSize:  10,
+			},
+		}, nil
+	case schemas.CodeBuddyCN:
+		// Tencent's gateway fronts the inference routes with an APISIX edge that can answer 5xx
+		// while it is rebalancing, so the suite retries like its other OpenAI-compatible peers.
 		return &schemas.ProviderConfig{
 			NetworkConfig: schemas.NetworkConfig{
 				DefaultRequestTimeoutInSeconds: 120,
