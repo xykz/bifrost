@@ -194,6 +194,15 @@ func decodeCodeBuddyLoginStatus(t *testing.T, body string) codeBuddyLoginStatusB
 	return decoded
 }
 
+func mustParseCodeBuddyTime(t *testing.T, value string) time.Time {
+	t.Helper()
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		t.Fatalf("%q is not RFC3339: %v", value, err)
+	}
+	return parsed
+}
+
 // TestCodeBuddyLoginStartRequiresAdminSession pins requirement 3: a deployment with dashboard
 // auth disabled must not offer an unauthenticated path to mint a credential.
 func TestCodeBuddyLoginStartRequiresAdminSession(t *testing.T) {
@@ -245,6 +254,9 @@ func TestCodeBuddyLoginFlowTransitions(t *testing.T) {
 	if _, err := time.Parse(time.RFC3339, started.ExpiresAt); err != nil {
 		t.Fatalf("expires_at = %q is not RFC3339: %v", started.ExpiresAt, err)
 	}
+	if flowDelta := time.Until(mustParseCodeBuddyTime(t, started.ExpiresAt)); flowDelta < 14*time.Minute || flowDelta > 16*time.Minute {
+		t.Fatalf("pending flow expires in %v, want the 15 minute window", flowDelta)
+	}
 	if stateCalls, _, _ := upstream.counts(); stateCalls != 1 {
 		t.Fatalf("upstream state calls = %d, want 1", stateCalls)
 	}
@@ -281,6 +293,22 @@ func TestCodeBuddyLoginFlowTransitions(t *testing.T) {
 	}
 	if delta := time.Until(tokenExpiry); delta < 50*time.Minute || delta > 62*time.Minute {
 		t.Fatalf("expires_at is %v away, want roughly the 3600s expiresIn", delta)
+	}
+	// The settled entry is pollable for its own shorter window, and the answer says so rather
+	// than keeping the pending flow's deadline.
+	stored, err := fixture.kv.Get("codebuddy:login:" + started.FlowID)
+	if err != nil {
+		t.Fatalf("completed flow vanished from the store: %v", err)
+	}
+	settledFlow, ok := stored.(*codeBuddyLoginFlow)
+	if !ok {
+		t.Fatalf("stored flow has type %T, want *codeBuddyLoginFlow", stored)
+	}
+	if settledFlow.State != "" {
+		t.Fatalf("settled flow still carries the upstream state %q", settledFlow.State)
+	}
+	if remaining := time.Until(mustParseCodeBuddyTime(t, settledFlow.ExpiresAt)); remaining > 5*time.Minute || remaining < 4*time.Minute {
+		t.Fatalf("settled flow keeps a %v window, want the shortened 5 minute one", remaining)
 	}
 
 	// A fourth poll after completion must answer from the stored flow. Another upstream call
@@ -379,6 +407,20 @@ func TestCodeBuddyLoginRefusedFlowIsTerminal(t *testing.T) {
 	if _, tokenCalls, _ := upstream.counts(); tokenCalls != 1 {
 		t.Fatalf("upstream token polled %d times, want 1: a failed flow must stay settled", tokenCalls)
 	}
+	stored, err := fixture.kv.Get("codebuddy:login:" + started.FlowID)
+	if err != nil {
+		t.Fatalf("failed flow vanished from the store: %v", err)
+	}
+	failedFlow, ok := stored.(*codeBuddyLoginFlow)
+	if !ok {
+		t.Fatalf("stored flow has type %T, want *codeBuddyLoginFlow", stored)
+	}
+	if remaining := time.Until(mustParseCodeBuddyTime(t, failedFlow.ExpiresAt)); remaining > 5*time.Minute || remaining < 4*time.Minute {
+		t.Fatalf("failed flow keeps a %v window, want the shortened 5 minute one", remaining)
+	}
+	if failedFlow.State != "" {
+		t.Fatalf("failed flow still carries the upstream state %q", failedFlow.State)
+	}
 }
 
 // TestCodeBuddyLoginExpiredFlowIsGone pins that a flow past its deadline is terminal: the poll
@@ -390,7 +432,7 @@ func TestCodeBuddyLoginExpiredFlowIsGone(t *testing.T) {
 	const flowID = "expired-flow"
 	// Stored as the JSON bytes a peer without a registered decoder would hand back, which is
 	// also the shape the expiry check has to survive.
-	stale := []byte(`{"state":"s1","provider":"codebuddy-cn","flow_expires_at":"2020-01-01T00:00:00Z"}`)
+	stale := []byte(`{"state":"s1","provider":"codebuddy-cn","expires_at":"2020-01-01T00:00:00Z"}`)
 	key := "codebuddy:login:" + flowID
 	if err := fixture.kv.SetWithTTL(key, stale, 15*time.Minute); err != nil {
 		t.Fatalf("seed expired flow: %v", err)
