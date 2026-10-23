@@ -189,8 +189,8 @@ reads **Re-authenticate** once a pair is stored.
 
 The same flow is available over the management API. Both endpoints require an authenticated admin
 session: a session-less request on a deployment with dashboard authentication enabled is rejected
-with `401`, and on a deployment whose dashboard authentication is disabled or unconfigured the
-handler refuses with `403` instead of minting a credential for anyone on the network.
+with `401`, and a request that reaches the handler through the unauthenticated path is refused with
+`403` instead of minting a credential for anyone on the network.
 
 ```bash
 # 1. Start the flow. The response carries the URL to open and its deadline.
@@ -247,20 +247,21 @@ A refresh that returns `401`, or the gateway's `12153` ("refresh token invalid")
 HTTP-200 body, is a **permanent** credential fault. The key that hit it is dropped for the rest of
 that request, so it is not retried there, and `AllowFallbacks` is false so the request is never
 drained onto another provider; if no other key on the provider can serve it, the client gets the
-`401`. The failure is cached only for a backoff window, though: `tokencache` records it as
-permanent with `DefaultPermanentBackoff` (2s, doubling, capped at 60s), and once that window
-elapses the next request retries the refresh. The classification only bounds how often the token
-endpoint is hit; it does not stop the retries, so expect a repeating `401` from the token endpoint
-in your metrics until the key is re-authenticated. Nothing recovers on its own.
+`401` (or, when `max_retries` is configured and every key is dead, a `502`
+`upstream_credentials_exhausted`). The failure is cached only for a backoff window, though:
+`tokencache` records it as permanent with `DefaultPermanentBackoff` (2s, doubling, capped at 60s),
+and once that window elapses the next request retries the refresh. The classification only bounds
+how often the token endpoint is hit; it does not stop the retries, so the failed requests keep
+recurring in your request metrics until the key is re-authenticated. Nothing recovers on its own.
 
 ### Re-authenticating a dead refresh token
 
 When the refresh token dies, requests on that key fail with a `401` whose message says the refresh
 token is invalid. Open the provider's key in **Models** > **Model Providers** and click
 **Re-authenticate** under **OAuth login**; the fresh pair replaces the dead one in the same write.
-The same replacement can be sent through the key update endpoint: `refresh_token` is the only
-required field, `access_token` is optional, and an absent `expires_at` is stored empty, which the
-refresh logic reads as "refresh on first use".
+The same replacement can be sent through the key update endpoint. Send `grant_type` and `token_url`
+unchanged (they are always required), plus the new `refresh_token`; `access_token` is optional, and
+an absent `expires_at` is stored empty, which the refresh logic reads as "refresh on first use".
 
 <Warning>
 **Deployments without a config store lose a rotated refresh token on restart.** With
@@ -391,7 +392,7 @@ the upstream list changes.
 <Accordion title="Dead Refresh Token Is Permanent">
 **Severity**: Medium
 **Behavior**: A `401` from the refresh endpoint, or code `12153` in an HTTP-200 body, is treated as a permanent credential fault and pins the error to `401` with fallbacks blocked
-**Impact**: The key is dropped for the rest of that request and the request does not fall back to another provider, so it fails unless another key on codebuddy-cn can serve it; the key must be re-authenticated. Later traffic retries the refresh on a capped 2s→60s backoff, so the failure repeats in the token-endpoint metrics rather than going quiet. Blocking the fallback is deliberate: it would otherwise hide a dead key behind traffic billed elsewhere
+**Impact**: The key is dropped for the rest of that request and the request does not fall back to another provider, so it fails unless another key on codebuddy-cn can serve it; the key must be re-authenticated. Later traffic retries the refresh on a capped 2s→60s backoff, so the failed requests recur instead of going quiet. Blocking the fallback is deliberate: it would otherwise hide a dead key behind traffic billed elsewhere
 **Code**: `parseError` in `core/providers/codebuddycn/errors.go`; `deadRefreshTokenError` in `core/providers/utils/tokencache/browserlogin.go`
 </Accordion>
 
@@ -404,7 +405,7 @@ the upstream list changes.
 
 <Accordion title="Login Requires an Admin Session">
 **Severity**: Medium
-**Behavior**: A session-less request on a deployment with dashboard authentication enabled is rejected with `401`; on a deployment whose dashboard authentication is disabled or unconfigured both handlers refuse with `403`, so the login is never an unauthenticated endpoint
+**Behavior**: A session-less request on a deployment with dashboard authentication enabled is rejected with `401`; a request that reaches the handler through the unauthenticated path is refused with `403`, so the login is never an unauthenticated endpoint
 **Impact**: Browser login is an operator action; it cannot be used as a per-end-user sign-in, and one credential set per key is shared by all gateway traffic
 **Code**: `startCodeBuddyLogin` and `pollCodeBuddyLogin` in `transports/bifrost-http/handlers/codebuddylogin.go`
 </Accordion>

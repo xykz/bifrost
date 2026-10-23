@@ -554,9 +554,9 @@ codebuddy-login-start:
       The login is an **admin** action, not a per-end-user sign-in: the resulting token pair is
       stored on a key and shared by every request that key serves. Both this endpoint and its
       poll require an authenticated admin session: a session-less request on a deployment with
-      dashboard authentication enabled is rejected with `401`, and on a deployment whose
-      dashboard authentication is disabled or unconfigured the handler refuses with `403` rather
-      than minting a credential for anyone on the network.
+      dashboard authentication enabled is rejected with `401`, and a request that reaches the
+      handler through the unauthenticated path is refused with `403` rather than minting a
+      credential for anyone on the network.
 
       The request body is ignored. The upstream host comes only from the provider's
       `network_config.base_url`, falling back to `https://copilot.tencent.com`, so this endpoint
@@ -632,9 +632,9 @@ codebuddy-login-poll:
       finishes, or one belonging to a different provider, answers `404`.
 
       Requires an authenticated admin session: a session-less request on a deployment with
-      dashboard authentication enabled is rejected with `401`. On a deployment whose dashboard
-      authentication is disabled or unconfigured the handler refuses with `403`, because a login
-      it cannot attribute to an admin is not run at all.
+      dashboard authentication enabled is rejected with `401`. A request that reaches the handler
+      through the unauthenticated path is refused with `403`, because a login it cannot attribute
+      to an admin is not run at all.
     tags:
       - Providers
     parameters:
