@@ -8757,55 +8757,96 @@ func (c *Config) AddProviderKey(ctx context.Context, provider schemas.ModelProvi
 	return nil
 }
 
-// UpdateProviderKeyTokens writes a refreshed browser_login credential onto a stored key without
-// rebuilding the provider. It is the persistence half of refresh-token rotation, and it exists
-// separately from UpdateProviderKey for one reason: UpdateProviderKey ends by calling
-// Bifrost.UpdateProvider, which stops and restarts that provider's worker queue. That is right for
-// an operator saving a key and wrong on the inference path, where a refresh happens.
+// TokenPersistTimeout bounds the background store write a rotation schedules. A rotation is
+// scheduled at most once per token lifetime per key, so a hung store cannot accumulate writes; the
+// timeout is what stops one hung write from holding a goroutine and a slot forever.
+const TokenPersistTimeout = 10 * time.Second
+
+// UpdateProviderKeyTokens applies a refreshed browser_login credential to the in-memory key and
+// schedules the matching store write. It exists separately from UpdateProviderKey for one reason:
+// UpdateProviderKey ends by calling Bifrost.UpdateProvider, which stops and restarts that
+// provider's worker queue. That is right for an operator saving a key and wrong on the inference
+// path, where a rotation is discovered.
 //
 // Nothing else needs rebuilding. Keys are read per request — BaseAccount.GetKeysForProvider →
 // Config.GetProviderConfigRaw — so replacing the in-memory key is by itself enough for the next
 // request to see the new token.
 //
+// The in-memory apply is synchronous and short: it runs under c.Mu, the same lock every request
+// takes to read keys, so it must not span a store round-trip. The store write is therefore handed
+// to a goroutine with its own timeout and is not waited on; the caller returns as soon as the token
+// is visible. Callers on the inference path — the provider's rotation sink — are invoked while
+// tokencache holds that credential's slot mutex, so any blocking here would stall every concurrent
+// request for the same key, and a slow store would stall key reads for every provider through c.Mu.
+//
+// Durability trade-off: the in-memory token is live immediately but the row write is asynchronous.
+// If the process dies in that window, the rotation is lost — upstream has already invalidated the
+// old refresh token, so the key needs a re-login. That window is milliseconds in practice and the
+// alternative is worse: a synchronous write under two locks makes one slow store a gateway-wide
+// stall.
+//
 // Only the three rotating fields change: the grant, endpoint and every operator-set field on the
 // key and its config are preserved. A delivery that would change nothing is skipped, so a
 // duplicate rotation is idempotent rather than a redundant row write.
+//
+// The returned error reports an in-memory apply failure only (unknown provider or key). Store
+// failures are logged from the background write, since the caller has already moved on.
 func (c *Config) UpdateProviderKeyTokens(ctx context.Context, provider schemas.ModelProvider, keyID, accessToken, refreshToken, expiresAt string) error {
+	updatedKey, changed, err := c.applyProviderKeyTokens(provider, keyID, accessToken, refreshToken, expiresAt)
+	if err != nil || !changed {
+		return err
+	}
+	if store := c.ConfigStore; store != nil && !skipDBUpdate(ctx) {
+		// The store is captured here rather than read inside the goroutine: a config reload can
+		// replace or clear it, and a nil dereference on a background goroutine would take the
+		// process down.
+		c.persistProviderKeyTokens(store, provider, keyID, updatedKey)
+	}
+	return nil
+}
+
+// applyProviderKeyTokens replaces the three rotating fields on the stored key and publishes it to
+// the in-memory provider map. It reports whether anything changed, so a duplicate delivery costs no
+// row write and no goroutine.
+func (c *Config) applyProviderKeyTokens(provider schemas.ModelProvider, keyID, accessToken, refreshToken, expiresAt string) (schemas.Key, bool, error) {
 	c.Mu.Lock()
 	defer c.Mu.Unlock()
 
 	existingConfig, exists := c.Providers[provider]
 	if !exists {
-		return ErrNotFound
+		return schemas.Key{}, false, ErrNotFound
 	}
 
 	index := slices.IndexFunc(existingConfig.Keys, func(existingKey schemas.Key) bool {
 		return existingKey.ID == keyID
 	})
 	if index == -1 {
-		return ErrNotFound
+		return schemas.Key{}, false, ErrNotFound
 	}
 
 	stored := existingConfig.Keys[index]
 	if stored.OAuthKeyConfig == nil {
 		// A rotation can only belong to a key that authenticates with a bundle. The key was
 		// edited to a pasted value while this refresh was in flight; the pasted value wins.
-		return nil
+		return schemas.Key{}, false, nil
 	}
 	// A write that changes nothing is skipped, which makes a duplicate delivery idempotent
 	// instead of a redundant row write. Every field is compared, not only the refresh token: an
 	// upstream that rotates nothing still mints a new access token, and that must be persisted or
 	// the next request would have to mint again.
-	if existingConfig.Keys[index].OAuthKeyConfig.AccessToken.GetValue() == accessToken &&
-		existingConfig.Keys[index].OAuthKeyConfig.RefreshToken.GetValue() == refreshToken &&
-		(expiresAt == "" || existingConfig.Keys[index].OAuthKeyConfig.ExpiresAt == expiresAt) {
-		return nil
+	if stored.OAuthKeyConfig.AccessToken.GetValue() == accessToken &&
+		stored.OAuthKeyConfig.RefreshToken.GetValue() == refreshToken &&
+		(expiresAt == "" || stored.OAuthKeyConfig.ExpiresAt == expiresAt) {
+		return schemas.Key{}, false, nil
 	}
 
 	updatedKey := stored
 	cfg := *stored.OAuthKeyConfig
-	cfg.AccessToken = schemas.NewSecretVar(accessToken)
-	cfg.RefreshToken = schemas.NewSecretVar(refreshToken)
+	// Built as plain values, not with NewSecretVar: a token is not a secret reference, and parsing
+	// it as one would misread an `env.`-shaped or JSON-shaped token and would turn a vault-backed
+	// field into a plaintext ref. resolveKey builds its token the same way.
+	cfg.AccessToken = &schemas.SecretVar{Val: accessToken, SecretType: schemas.SecretTypePlainText}
+	cfg.RefreshToken = &schemas.SecretVar{Val: refreshToken, SecretType: schemas.SecretTypePlainText}
 	if expiresAt != "" {
 		cfg.ExpiresAt = expiresAt
 	}
@@ -8815,31 +8856,83 @@ func (c *Config) UpdateProviderKeyTokens(ctx context.Context, provider schemas.M
 	updatedConfig.Keys = append([]schemas.Key(nil), existingConfig.Keys...)
 	updatedConfig.Keys[index] = updatedKey
 
-	if c.ConfigStore != nil && !skipDBUpdate(ctx) {
-		if err := c.ConfigStore.UpdateProviderKey(ctx, provider, keyID, updatedKey); err != nil {
-			if errors.Is(err, configstore.ErrNotFound) {
-				return ErrNotFound
-			}
-			return fmt.Errorf("failed to persist rotated provider key tokens: %w", err)
+	c.Providers[provider] = updatedConfig
+	return updatedKey, true, nil
+}
+
+// persistProviderKeyTokens writes the rotation to the config store on a bounded, detached
+// goroutine. It is started only for a rotation that actually changed the key, so the goroutine
+// count is bounded by the number of keys times the refresh rate the token lifetime allows.
+//
+// The write runs detached from the request that discovered the rotation: tokencache runs the mint
+// on a context that already survives client disconnects, and a rotation must land even if the
+// client that happened to trigger it hangs up.
+func (c *Config) persistProviderKeyTokens(store configstore.ConfigStore, provider schemas.ModelProvider, keyID string, key schemas.Key) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), TokenPersistTimeout)
+		defer cancel()
+
+		if err := store.UpdateProviderKey(ctx, provider, keyID, key); err != nil {
+			// Logged, not returned: the caller was told the rotation succeeded (it did, in memory),
+			// and the only consequence is that a restart needs a re-login for this key.
+			logger.Error("failed to persist rotated provider key tokens for key %s of provider %s: %v", keyID, provider, err)
+			return
 		}
-		// The vault store callback rewrites a secret into a vault reference during the DB write,
-		// on the store-side row copy only. Re-read so the in-memory key carries FromVault/VaultRef
-		// instead of the plaintext the caller supplied.
-		storedKey, err := c.ConfigStore.GetProviderKey(ctx, provider, keyID)
+		// The store may rewrite secrets into environment or vault references on its own row copy.
+		// Re-read so the in-memory key carries the references rather than the plaintext, matching
+		// what AddProviderKey and UpdateProviderKey do. A failure here leaves the plaintext in
+		// memory, which still authenticates; the row is already written.
+		storedKey, err := store.GetProviderKey(ctx, provider, keyID)
 		if err != nil {
 			logger.Error("failed to re-read stored key %s for provider %s after token update: %v", keyID, provider, err)
-			return fmt.Errorf("failed to re-read provider key after token update: %w", err)
+			return
 		}
-		updatedConfig.Keys[index] = *storedKey
+		c.replaceProviderKeyOAuthTokens(provider, keyID, storedKey)
+	}()
+}
+
+// replaceProviderKeyOAuthTokens adopts the store's copy of the OAuth block if the in-memory key
+// still holds the tokens this write stored. Comparing first matters: a newer rotation may have
+// applied while the write was in flight, and the older store copy must not overwrite the newer
+// token in memory.
+func (c *Config) replaceProviderKeyOAuthTokens(provider schemas.ModelProvider, keyID string, storedKey *schemas.Key) {
+	if storedKey == nil || storedKey.OAuthKeyConfig == nil {
+		return
+	}
+	c.Mu.Lock()
+	defer c.Mu.Unlock()
+
+	existingConfig, exists := c.Providers[provider]
+	if !exists {
+		return
+	}
+	index := slices.IndexFunc(existingConfig.Keys, func(existingKey schemas.Key) bool {
+		return existingKey.ID == keyID
+	})
+	if index == -1 {
+		return
+	}
+	current := existingConfig.Keys[index].OAuthKeyConfig
+	if current == nil || current.RefreshToken.GetValue() != storedKey.OAuthKeyConfig.RefreshToken.GetValue() {
+		return
 	}
 
+	updatedConfig := existingConfig
+	updatedConfig.Keys = append([]schemas.Key(nil), existingConfig.Keys...)
+	updatedKey := existingConfig.Keys[index]
+	updatedKey.OAuthKeyConfig = storedKey.OAuthKeyConfig
+	updatedConfig.Keys[index] = updatedKey
 	c.Providers[provider] = updatedConfig
-
-	logger.Debug("Persisted rotated credential for key %s of provider: %s", keyID, provider)
-	return nil
 }
 
 // skipDBUpdate reports whether the context asks configuration writes to leave the store alone.
+//
+// In this file the same check is written inline seven times; this is the shared spelling for the
+// new method only. It is genuinely live rather than defensive: UpdateProviderKeyTokens is a public
+// method, and a caller holding a BifrostContext with BifrostContextKeySkipDBUpdate set would be
+// silently ignored without it. The rotation sink does call it with context.Background(), so on that
+// path the check always falls through — which is correct, since a rotation is a real state change
+// that must reach the store.
 func skipDBUpdate(ctx context.Context) bool {
 	if v := ctx.Value(schemas.BifrostContextKeySkipDBUpdate); v != nil {
 		if skip, ok := v.(bool); ok {
@@ -8847,6 +8940,34 @@ func skipDBUpdate(ctx context.Context) bool {
 		}
 	}
 	return false
+}
+
+// preserveRotatedOAuthTokens resolves browser_login's two rotating credential fields against the
+// key stored right now, under the write lock, rather than against the copy the handler read before
+// it merged. They rotate at runtime: a refresh can land between the handler's read and this write,
+// and a save that echoes the mask it was shown would otherwise restore the precursor refresh token,
+// which upstream has already invalidated — leaving the key dead until a re-login.
+//
+// The mask itself is the signal. The handler refuses a mask that had no stored counterpart at read
+// time, so a mask reaching here means "unchanged" and the current stored value is the right answer.
+// A mask with nothing stored now (the block was cleared in between) is left as-is; the next refresh
+// will mint and its sink will fill the fields back in.
+//
+// Taking the stored value under the lock covers both orderings: if the rotation committed before
+// this write, the stored value is the new token; if it commits after, it overwrites this write.
+func preserveRotatedOAuthTokens(incoming schemas.Key, stored schemas.Key) schemas.Key {
+	if incoming.OAuthKeyConfig == nil || stored.OAuthKeyConfig == nil {
+		return incoming
+	}
+	cfg := *incoming.OAuthKeyConfig
+	if cfg.AccessToken.IsMaskedPlaceholder() && stored.OAuthKeyConfig.AccessToken.IsSet() {
+		cfg.AccessToken = stored.OAuthKeyConfig.AccessToken
+	}
+	if cfg.RefreshToken.IsMaskedPlaceholder() && stored.OAuthKeyConfig.RefreshToken.IsSet() {
+		cfg.RefreshToken = stored.OAuthKeyConfig.RefreshToken
+	}
+	incoming.OAuthKeyConfig = &cfg
+	return incoming
 }
 
 // UpdateProviderKey updates a single key on an existing provider configuration.
@@ -8868,6 +8989,7 @@ func (c *Config) UpdateProviderKey(ctx context.Context, provider schemas.ModelPr
 
 	updatedConfig := existingConfig
 	updatedConfig.Keys = append([]schemas.Key(nil), existingConfig.Keys...)
+	key = preserveRotatedOAuthTokens(key, existingConfig.Keys[index])
 	key.ID = keyID
 	updatedConfig.Keys[index] = key
 

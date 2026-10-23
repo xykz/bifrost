@@ -1000,9 +1000,11 @@ func BenchmarkEditorHeaders(b *testing.B) {
 	}
 }
 
-// BenchmarkResolveKeyWarm is the per-request cost of a browser_login key once its access token is
-// cached: deriving the credential's cache key and the cache lookup. A pasted key never reaches
-// this path — BenchmarkAuthHeaderForStaticKey covers that one.
+// BenchmarkResolveKeyWarm is the per-request cost of a browser_login key whose token lives only in
+// tokencache: deriving the credential's cache key and the cache lookup. The key here carries no
+// stored access token, so it takes the mint path's warm branch rather than the stored-token fast
+// path. BenchmarkResolveKeyOAuthStoredToken covers the path a settled deployment actually pays; a
+// pasted key never reaches either — BenchmarkAuthHeaderForStaticKey covers that one.
 func BenchmarkResolveKeyWarm(b *testing.B) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1029,9 +1031,9 @@ func BenchmarkResolveKeyWarm(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		if _, bErr := provider.resolveKey(ctx, key); bErr != nil {
-			b.Fatal(bErr)
-		}
+		// Sunk, not discarded: an unread result lets the compiler elide the call and report a
+		// fake cost.
+		benchResolvedKeySink, benchResolveKeyErrSink = provider.resolveKey(ctx, key)
 	}
 }
 
@@ -1199,8 +1201,8 @@ func TestResolveKeyReusesThePersistedAccessToken(t *testing.T) {
 }
 
 // TestResolveKeyRefreshesWhenTheStoredAccessTokenIsStale pins the other half: the fast path is a
-// freshness check, not a cache of its own. A token inside the refresh margin is minted again even
-// though it is present on the key.
+// freshness check, not a cache of its own. An expired token is minted again even though it is
+// present on the key.
 func TestResolveKeyRefreshesWhenTheStoredAccessTokenIsStale(t *testing.T) {
 	var mu sync.Mutex
 	refreshes := 0
@@ -1220,12 +1222,12 @@ func TestResolveKeyRefreshesWhenTheStoredAccessTokenIsStale(t *testing.T) {
 		TokenURL:     *schemas.NewSecretVar(server.URL + "/v2/plugin/auth/token/refresh"),
 		AccessToken:  schemas.NewSecretVar("access-stale"),
 		RefreshToken: schemas.NewSecretVar("refresh-1"),
-		ExpiresAt:    time.Now().Add(30 * time.Second).UTC().Format(time.RFC3339),
+		ExpiresAt:    time.Now().Add(-time.Minute).UTC().Format(time.RFC3339),
 	}}
 
 	resolved, bErr := p.resolveKey(ctx, key)
 	require.Nil(t, bErr)
-	require.Equal(t, "access-new", resolved.Value.GetValue(), "a token inside the refresh margin must be renewed")
+	require.Equal(t, "access-new", resolved.Value.GetValue(), "an expired stored token must be renewed")
 	mu.Lock()
 	defer mu.Unlock()
 	require.Equal(t, 1, refreshes)
@@ -1245,10 +1247,11 @@ func BenchmarkResolveKeyPastedValue(b *testing.B) {
 	}
 }
 
-// BenchmarkResolveKeyOAuthWarm measures the per-request cost of a browser_login key whose access
-// token is stored and still fresh: the comparison the fast path adds, plus whatever expiry check
-// decides it. It never reaches the cache, so it is the cost a settled deployment pays.
-func BenchmarkResolveKeyOAuthWarm(b *testing.B) {
+// BenchmarkResolveKeyOAuthStoredToken measures the per-request cost of a browser_login key whose
+// access token is stored and still fresh: the grant check, the two expiry comparisons and the
+// margin arithmetic, with no cache lookup. It is the cost a settled deployment pays, and it is
+// deliberately separate from BenchmarkResolveKeyWarm so the primed-cache cost stays named.
+func BenchmarkResolveKeyOAuthStoredToken(b *testing.B) {
 	p := newTestProvider(b, "")
 	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
 	key := schemas.Key{ID: "key-1", OAuthKeyConfig: &schemas.OAuthKeyConfig{
@@ -1281,22 +1284,96 @@ func TestStoredAccessTokenIsOnlyUsedWhenItsExpirySaysSo(t *testing.T) {
 	future := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
 	past := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
 
+	// browserLogin is the grant a stored token is meaningful for. The grant gate itself is
+	// covered separately below.
+	at := func(expiresAt string) schemas.OAuthKeyConfig {
+		return schemas.OAuthKeyConfig{
+			GrantType:   schemas.OAuthGrantBrowserLogin,
+			AccessToken: schemas.NewSecretVar("a"),
+			ExpiresAt:   expiresAt,
+		}
+	}
+	now := time.Now()
+
 	cases := []struct {
 		name string
 		cfg  schemas.OAuthKeyConfig
 		want string
 	}{
-		{"fresh token", schemas.OAuthKeyConfig{AccessToken: schemas.NewSecretVar("a"), ExpiresAt: future}, "a"},
-		{"no access token", schemas.OAuthKeyConfig{ExpiresAt: future}, ""},
-		{"no expiry means refresh on use", schemas.OAuthKeyConfig{AccessToken: schemas.NewSecretVar("a")}, ""},
-		{"expired", schemas.OAuthKeyConfig{AccessToken: schemas.NewSecretVar("a"), ExpiresAt: past}, ""},
-		{"inside the refresh margin", schemas.OAuthKeyConfig{AccessToken: schemas.NewSecretVar("a"), ExpiresAt: time.Now().Add(30 * time.Second).UTC().Format(time.RFC3339)}, ""},
-		{"unparseable expiry", schemas.OAuthKeyConfig{AccessToken: schemas.NewSecretVar("a"), ExpiresAt: "tomorrow"}, ""},
-		{"whitespace-only token", schemas.OAuthKeyConfig{AccessToken: schemas.NewSecretVar("  "), ExpiresAt: future}, ""},
+		{"fresh token", at(future), "a"},
+		{"no access token", schemas.OAuthKeyConfig{GrantType: schemas.OAuthGrantBrowserLogin, ExpiresAt: future}, ""},
+		{"no expiry means refresh on use", at(""), ""},
+		{"expired", at(past), ""},
+		// A token already inside the margin is trusted for half of what is left, matching the
+		// cache's clamp (tokencache.RefreshAt). Treating it as due here would re-mint per request
+		// for every key whose lifetime is shorter than the margin.
+		{"inside the refresh margin still serves", at(now.Add(30 * time.Second).UTC().Format(time.RFC3339)), "a"},
+		{"unparseable expiry", at("tomorrow"), ""},
+		{"whitespace-only token", schemas.OAuthKeyConfig{GrantType: schemas.OAuthGrantBrowserLogin, AccessToken: schemas.NewSecretVar("  "), ExpiresAt: future}, ""},
+		// A self-declared expiry is not a trust boundary. Beyond the cap the token is ignored and
+		// minted, which is always safe: the refresh token is still the credential.
+		{"a far-future expiry is not trusted", at(now.Add(48 * time.Hour).UTC().Format(time.RFC3339)), ""},
+		{"a token just inside the lifetime cap is trusted", at(now.Add(maxAccessTokenLifetime - time.Minute).UTC().Format(time.RFC3339)), "a"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			require.Equal(t, tc.want, storedAccessToken(tc.cfg))
+			require.Equal(t, tc.want, storedAccessToken(tc.cfg, now))
 		})
 	}
+}
+
+// TestStoredAccessTokenIsOnlyForBrowserLogin pins the grant gate. Validate ignores access_token for
+// client_credentials and jwt_bearer, so an operator can leave one on such a key by hand; honouring
+// it would send that value as the bearer instead of minting.
+func TestStoredAccessTokenIsOnlyForBrowserLogin(t *testing.T) {
+	now := time.Now()
+	future := now.Add(time.Hour).UTC().Format(time.RFC3339)
+	for _, grant := range []schemas.OAuthGrantType{schemas.OAuthGrantClientCredentials, schemas.OAuthGrantJWTBearer, ""} {
+		t.Run(string(grant), func(t *testing.T) {
+			cfg := schemas.OAuthKeyConfig{
+				GrantType:   grant,
+				AccessToken: schemas.NewSecretVar("operator-pasted"),
+				ExpiresAt:   future,
+			}
+			require.Empty(t, storedAccessToken(cfg, now), "a stored access token must not be used for %q", grant)
+		})
+	}
+}
+
+// TestResolveKeyMintsForANonBrowserLoginGrantCarryingAnAccessToken is the same gate seen from the
+// request path: the key must still be minted, not served from the inert field.
+func TestResolveKeyMintsForANonBrowserLoginGrantCarryingAnAccessToken(t *testing.T) {
+	var mu sync.Mutex
+	refreshes := 0
+	access := "minted-access"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/token" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		mu.Lock()
+		refreshes++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"` + access + `","token_type":"Bearer","expires_in":3600}`))
+	}))
+	defer server.Close()
+
+	p := newTestProvider(t, server.URL)
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	key := schemas.Key{ID: "key-1", OAuthKeyConfig: &schemas.OAuthKeyConfig{
+		GrantType:    schemas.OAuthGrantClientCredentials,
+		TokenURL:     *schemas.NewSecretVar(server.URL + "/token"),
+		ClientID:     schemas.NewSecretVar("id"),
+		ClientSecret: schemas.NewSecretVar("secret"),
+		AccessToken:  schemas.NewSecretVar("operator-pasted"),
+		ExpiresAt:    time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+	}}
+
+	resolved, bErr := p.resolveKey(ctx, key)
+	require.Nil(t, bErr)
+	require.Equal(t, access, resolved.Value.GetValue(), "a client_credentials key must mint, not use its inert access_token")
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, 1, refreshes)
 }

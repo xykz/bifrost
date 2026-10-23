@@ -41,6 +41,14 @@ const (
 	// modelsPath is the live catalogue. It 404s today, which is why the pinned catalog is the
 	// expected answer rather than a fallback of last resort.
 	modelsPath = "/v2/models"
+	// maxAccessTokenLifetime is the longest access-token life this code will trust from a stored
+	// expiry. The endpoint reports 3600s, and its own fallback when it reports none is 2 minutes, so
+	// 24 hours leaves a wide margin for a longer-lived future deployment while still bounding the
+	// damage a hand-written, copied, or clock-skewed expiry can do: a token with a far-future
+	// expiry would otherwise pin a revoked credential until an operator edited the key.
+	//
+	// It is not a correctness knob. Exceeding it only means one extra mint, which is safe.
+	maxAccessTokenLifetime = 24 * time.Hour
 )
 
 // CodeBuddyCNProvider implements the Provider interface for Tencent CodeBuddy (China).
@@ -142,7 +150,10 @@ func (p *CodeBuddyCNProvider) resolveKey(ctx context.Context, key schemas.Key) (
 	if key.OAuthKeyConfig == nil || strings.TrimSpace(key.Value.GetValue()) != "" {
 		return key, nil
 	}
-	if token := storedAccessToken(*key.OAuthKeyConfig); token != "" {
+	// iat is read once and shared: the expiry check and the sink's timestamp then agree, and the
+	// path takes one clock read instead of three.
+	iat := time.Now()
+	if token := storedAccessToken(*key.OAuthKeyConfig, iat); token != "" {
 		key.Value = schemas.SecretVar{Val: token, SecretType: schemas.SecretTypePlainText}
 		return key, nil
 	}
@@ -157,14 +168,24 @@ func (p *CodeBuddyCNProvider) resolveKey(ctx context.Context, key schemas.Key) (
 	return key, nil
 }
 
-// storedAccessToken returns the access token recorded on cfg when it is still usable, or "" when
-// there is none, it is inside the refresh margin, or it has no recorded expiry. The margin is
-// tokencache's, so a token the cache would already consider due is not trusted here either.
+// storedAccessToken returns the access token recorded on cfg when it may be used as-is, or "" when
+// it must be minted instead. The decision is two comparisons and no allocation.
 //
-// An empty ExpiresAt means "refresh on use" — that is the documented contract of the field — so a
-// token without one is not used. The provider always stamps an expiry when it persists a rotation,
-// so this only costs the first request after a key was hand-written without one.
-func storedAccessToken(cfg schemas.OAuthKeyConfig) string {
+// Only browser_login qualifies. That grant is the one whose access token this provider persists,
+// and it is the only grant for which Validate permits a stored token to be meaningful. A
+// client_credentials or jwt_bearer key may carry an access_token anyway (Validate ignores the field
+// for those grants), and honouring it would send an operator's pasted value instead of minting.
+//
+// Freshness reuses tokencache's margin arithmetic, so a token the cache would consider due is not
+// trusted here either — including a token whose lifetime was shorter than the margin, which the
+// cache keeps for the rest of its life rather than re-minting per request.
+//
+// An empty ExpiresAt means "refresh on use" — the field's documented contract — so a token without
+// one is not used. An expiry further out than maxAccessTokenLifetime is refused as well.
+func storedAccessToken(cfg schemas.OAuthKeyConfig, now time.Time) string {
+	if cfg.GrantType != schemas.OAuthGrantBrowserLogin {
+		return ""
+	}
 	token := strings.TrimSpace(cfg.AccessToken.GetValue())
 	if token == "" {
 		return ""
@@ -180,7 +201,13 @@ func storedAccessToken(cfg schemas.OAuthKeyConfig) string {
 		// trusting it would pin a token of unknown age.
 		return ""
 	}
-	if time.Now().Add(tokencache.DefaultRefreshMargin).Before(deadline) {
+	// A self-declared expiry is not a trust boundary: a hand-written, copied, or clock-skewed
+	// value must not pin a revoked token indefinitely. Beyond the cap the token is ignored and
+	// minted, which is always safe — the refresh token is still the credential.
+	if deadline.Sub(now) > maxAccessTokenLifetime {
+		return ""
+	}
+	if !tokencache.RefreshAt(deadline, now, tokencache.DefaultRefreshMargin).Before(now) {
 		return token
 	}
 	return ""

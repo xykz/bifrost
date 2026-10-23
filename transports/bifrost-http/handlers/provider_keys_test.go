@@ -17,12 +17,14 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	bifrost "github.com/maximhq/bifrost/core"
 	"github.com/maximhq/bifrost/core/providers/codebuddycn"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/framework/configstore"
 	"github.com/maximhq/bifrost/transports/v2/bifrost-http/lib"
+	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
 	"gorm.io/gorm"
 )
@@ -1957,8 +1959,14 @@ func TestProviderKeyWrites_RejectUnknownOAuthKeyConfigFields(t *testing.T) {
 // value, and so the assertions below can only pass on a real store round-trip.
 type tokenWriteStore struct {
 	configstore.ConfigStore
-	keys   map[string]schemas.Key
+	keys map[string]schemas.Key
+	// mu guards keys and writes: the rotation write runs on a background goroutine, so the test
+	// goroutine and the store goroutine touch these fields concurrently.
+	mu     sync.Mutex
 	writes int
+	// persistDelay stalls every store call, so a test can prove the request path does not wait
+	// for the write. It is applied to both UpdateProviderKey and GetProviderKey.
+	persistDelay time.Duration
 }
 
 func newTokenWriteStore(keys ...schemas.Key) *tokenWriteStore {
@@ -1969,7 +1977,16 @@ func newTokenWriteStore(keys ...schemas.Key) *tokenWriteStore {
 	return store
 }
 
-func (s *tokenWriteStore) UpdateProviderKey(_ context.Context, _ schemas.ModelProvider, keyID string, key schemas.Key, _ ...*gorm.DB) error {
+func (s *tokenWriteStore) UpdateProviderKey(ctx context.Context, _ schemas.ModelProvider, keyID string, key schemas.Key, _ ...*gorm.DB) error {
+	if s.persistDelay > 0 {
+		select {
+		case <-time.After(s.persistDelay):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if _, ok := s.keys[keyID]; !ok {
 		return configstore.ErrNotFound
 	}
@@ -1978,12 +1995,56 @@ func (s *tokenWriteStore) UpdateProviderKey(_ context.Context, _ schemas.ModelPr
 	return nil
 }
 
-func (s *tokenWriteStore) GetProviderKey(_ context.Context, _ schemas.ModelProvider, keyID string) (*schemas.Key, error) {
+func (s *tokenWriteStore) GetProviderKey(ctx context.Context, _ schemas.ModelProvider, keyID string) (*schemas.Key, error) {
+	if s.persistDelay > 0 {
+		select {
+		case <-time.After(s.persistDelay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	key, ok := s.keys[keyID]
 	if !ok {
 		return nil, configstore.ErrNotFound
 	}
 	return &key, nil
+}
+
+// storedKey returns one key as the store holds it now.
+func (s *tokenWriteStore) storedKey(t *testing.T, keyID string) schemas.Key {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.keys[keyID]
+}
+
+// writeCount reports how many store writes have landed.
+func (s *tokenWriteStore) writeCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.writes
+}
+
+// storedProviderKey reads a key through the locked accessor. The rotation write persists on a
+// background goroutine, so a test that indexed config.Providers directly would race with it.
+func storedProviderKey(t *testing.T, config *lib.Config, keyID string) schemas.Key {
+	t.Helper()
+	key, err := config.GetProviderKeyRaw(schemas.CodeBuddyCN, keyID)
+	if err != nil {
+		t.Fatalf("GetProviderKeyRaw: %v", err)
+	}
+	return *key
+}
+
+// awaitWrites waits for the asynchronous rotation write to land. The rotation applies to the
+// in-memory key synchronously and persists on a background goroutine, so an assertion about the
+// store has to wait rather than read immediately.
+func (s *tokenWriteStore) awaitWrites(t *testing.T, want int) {
+	t.Helper()
+	require.Eventually(t, func() bool { return s.writeCount() == want }, 5*time.Second, time.Millisecond,
+		"store writes = %d, want %d", s.writeCount(), want)
 }
 
 // browserLoginConfig is a complete browser_login bundle. The endpoint is the real CodeBuddy one,
@@ -2172,10 +2233,8 @@ func TestUpdateProviderKeyTokensSkipsProviderRebuild(t *testing.T) {
 	if got := inMemory.Providers[schemas.CodeBuddyCN].Keys[0].OAuthKeyConfig; got.AccessToken.GetValue() != "access-2" || got.RefreshToken.GetValue() != "refresh-2" {
 		t.Fatalf("in-memory key still carries %q/%q, want access-2/refresh-2", got.AccessToken.GetValue(), got.RefreshToken.GetValue())
 	}
-	if store.writes != 1 {
-		t.Fatalf("store writes = %d, want 1", store.writes)
-	}
-	if got := store.keys["key-1"].OAuthKeyConfig; got == nil || got.RefreshToken.GetValue() != "refresh-2" {
+	store.awaitWrites(t, 1)
+	if got := store.storedKey(t, "key-1").OAuthKeyConfig; got == nil || got.RefreshToken.GetValue() != "refresh-2" {
 		t.Fatalf("the store must receive the rotation, got %+v", got)
 	}
 	// A refresh must not touch the runtime shape: Bifrost.UpdateProvider swaps the provider
@@ -2185,7 +2244,7 @@ func TestUpdateProviderKeyTokensSkipsProviderRebuild(t *testing.T) {
 	}
 	// Everything else on the struct is preserved: a rotation only rewrites the two tokens and
 	// the expiry, never the grant, endpoint, or operator-set fields.
-	if got := inMemory.Providers[schemas.CodeBuddyCN].Keys[0]; got.Name != "cb" || got.Weight != 1 {
+	if got := storedProviderKey(t, inMemory, "key-1"); got.Name != "cb" || got.Weight != 1 {
 		t.Fatalf("the rotation clobbered unrelated key fields: %+v", got)
 	}
 }
@@ -2230,8 +2289,10 @@ func TestUpdateProviderKeyTokensIdempotentAndAccessOnly(t *testing.T) {
 				t.Fatalf("UpdateProviderKeyTokens: %v", err)
 			}
 		}
-		if store.writes != 0 {
-			t.Fatalf("store writes = %d, want 0 for a delivery that changes nothing", store.writes)
+		// No goroutine is started for a delivery that changes nothing, so this is a real
+		// assertion about absence rather than a wait.
+		if n := store.writeCount(); n != 0 {
+			t.Fatalf("store writes = %d, want 0 for a delivery that changes nothing", n)
 		}
 	})
 
@@ -2243,13 +2304,11 @@ func TestUpdateProviderKeyTokensIdempotentAndAccessOnly(t *testing.T) {
 		if err := config.UpdateProviderKeyTokens(context.Background(), schemas.CodeBuddyCN, "key-1", "access-2", "refresh-stored", "2026-10-22T13:00:00Z"); err != nil {
 			t.Fatalf("UpdateProviderKeyTokens: %v", err)
 		}
-		if store.writes != 1 {
-			t.Fatalf("store writes = %d, want 1", store.writes)
-		}
-		if got := config.Providers[schemas.CodeBuddyCN].Keys[0].OAuthKeyConfig; got.AccessToken.GetValue() != "access-2" || got.ExpiresAt != "2026-10-22T13:00:00Z" {
+		store.awaitWrites(t, 1)
+		if got := storedProviderKey(t, config, "key-1").OAuthKeyConfig; got.AccessToken.GetValue() != "access-2" || got.ExpiresAt != "2026-10-22T13:00:00Z" {
 			t.Fatalf("access token/expiry not persisted: %+v", got)
 		}
-		if got := config.Providers[schemas.CodeBuddyCN].Keys[0].OAuthKeyConfig.RefreshToken.GetValue(); got != "refresh-stored" {
+		if got := storedProviderKey(t, config, "key-1").OAuthKeyConfig.RefreshToken.GetValue(); got != "refresh-stored" {
 			t.Fatalf("refresh token = %q, want the unrotated one", got)
 		}
 	})
@@ -2304,7 +2363,7 @@ func TestInstallCodeBuddyCredentialSinkPersistsARotation(t *testing.T) {
 		t.Fatalf("new provider: %v", err)
 	}
 
-	key := config.Providers[schemas.CodeBuddyCN].Keys[0]
+	key := storedProviderKey(t, config, "key-1")
 	key.OAuthKeyConfig.TokenURL = *schemas.NewSecretVar(server.URL + "/v2/plugin/auth/token/refresh")
 	key.OAuthKeyConfig.RefreshToken = schemas.NewSecretVar("refresh-1")
 
@@ -2323,13 +2382,124 @@ func TestInstallCodeBuddyCredentialSinkPersistsARotation(t *testing.T) {
 		t.Fatalf("refresh calls = %d, want 1", refreshCalls)
 	}
 
-	if got := config.Providers[schemas.CodeBuddyCN].Keys[0].OAuthKeyConfig; got.RefreshToken.GetValue() != "refresh-2" {
+	if got := storedProviderKey(t, config, "key-1").OAuthKeyConfig; got.RefreshToken.GetValue() != "refresh-2" {
 		t.Fatalf("refresh token = %q, want refresh-2", got.RefreshToken.GetValue())
 	}
-	if store.writes != 1 {
-		t.Fatalf("store writes = %d, want 1", store.writes)
-	}
-	if got := store.keys["key-1"].OAuthKeyConfig; got.AccessToken.GetValue() != "access-2" {
+	store.awaitWrites(t, 1)
+	if got := store.storedKey(t, "key-1").OAuthKeyConfig; got.AccessToken.GetValue() != "access-2" {
 		t.Fatalf("store did not receive the rotation: %+v", got)
+	}
+}
+
+// TestRotatedTokenPersistDoesNotBlockTheRequestPath pins the reason UpdateProviderKeyTokens splits
+// the in-memory apply from the store write. The provider invokes the sink while tokencache holds
+// that credential's slot mutex, so a slow store awaited there would stall every concurrent request
+// for the key — and, through c.Mu, key reads for every provider.
+//
+// The store stub blocks far longer than the persist timeout. The call must still return promptly
+// with the new token already visible in memory, and the background write must then give up on its
+// own bound instead of leaking a goroutine forever.
+func TestRotatedTokenPersistDoesNotBlockTheRequestPath(t *testing.T) {
+	SetLogger(&mockLogger{})
+	lib.SetLogger(&mockLogger{})
+
+	store := newTokenWriteStore(schemas.Key{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: browserLoginConfig()})
+	store.persistDelay = 2 * lib.TokenPersistTimeout
+	config := &lib.Config{
+		ConfigStore: store,
+		Providers: map[schemas.ModelProvider]configstore.ProviderConfig{
+			schemas.CodeBuddyCN: {Keys: []schemas.Key{{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: browserLoginConfig()}}},
+		},
+	}
+
+	start := time.Now()
+	if err := config.UpdateProviderKeyTokens(context.Background(), schemas.CodeBuddyCN, "key-1", "access-2", "refresh-2", "2026-10-22T13:00:00Z"); err != nil {
+		t.Fatalf("UpdateProviderKeyTokens: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	// The token must already be readable: it is what the next request uses.
+	if got := storedProviderKey(t, config, "key-1").OAuthKeyConfig; got.AccessToken.GetValue() != "access-2" {
+		t.Fatalf("in-memory token = %q, want access-2 immediately after the call", got.AccessToken.GetValue())
+	}
+	if elapsed > lib.TokenPersistTimeout/2 {
+		t.Fatalf("UpdateProviderKeyTokens blocked for %s against a store that never answers", elapsed)
+	}
+}
+
+// TestOperatorUpdateKeepsAConcurrentRotation pins the window between the handler's read and its
+// write. The handler captures a key, merges outside the lock, then writes the whole key; a refresh
+// that lands in between rotates the refresh token, and a naive write would restore the precursor —
+// which upstream has already invalidated, killing the key until a re-login.
+func TestOperatorUpdateKeepsAConcurrentRotation(t *testing.T) {
+	SetLogger(&mockLogger{})
+	lib.SetLogger(&mockLogger{})
+
+	stale := browserLoginConfig()
+	config := &lib.Config{
+		Providers: map[schemas.ModelProvider]configstore.ProviderConfig{
+			schemas.CodeBuddyCN: {Keys: []schemas.Key{{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: browserLoginConfig()}}},
+		},
+	}
+	// The operator path rebuilds the provider, so it needs a client; the rotation path must not.
+	attachBifrostClient(t, config)
+
+	// The rotation lands after the operator's read but before the operator's write.
+	if err := config.UpdateProviderKeyTokens(context.Background(), schemas.CodeBuddyCN, "key-1", "access-2", "refresh-2", "2026-10-22T13:00:00Z"); err != nil {
+		t.Fatalf("UpdateProviderKeyTokens: %v", err)
+	}
+
+	// The operator saves what it read: a key carrying the masks it was shown, plus a rename.
+	operatorKey := schemas.Key{
+		ID:             "key-1",
+		Name:           "renamed",
+		Weight:         1,
+		OAuthKeyConfig: stale.Redacted(),
+	}
+	if err := config.UpdateProviderKey(context.Background(), schemas.CodeBuddyCN, "key-1", operatorKey); err != nil {
+		t.Fatalf("UpdateProviderKey: %v", err)
+	}
+
+	got := storedProviderKey(t, config, "key-1").OAuthKeyConfig
+	if got.RefreshToken.GetValue() != "refresh-2" {
+		t.Fatalf("refresh token = %q, want the rotated refresh-2; the operator write restored the invalidated precursor", got.RefreshToken.GetValue())
+	}
+	if got.AccessToken.GetValue() != "access-2" {
+		t.Fatalf("access token = %q, want the rotated access-2", got.AccessToken.GetValue())
+	}
+	// The operator's actual edit must still apply.
+	if stored := storedProviderKey(t, config, "key-1"); stored.Name != "renamed" {
+		t.Fatalf("the operator's rename was lost: %+v", stored)
+	}
+}
+
+// TestOperatorUpdateWithExplicitTokensOverwritesTheStoredOnes pins the other side of the same
+// guard: a literal token is an intentional edit, so it must win over whatever is stored.
+func TestOperatorUpdateWithExplicitTokensOverwritesTheStoredOnes(t *testing.T) {
+	SetLogger(&mockLogger{})
+	lib.SetLogger(&mockLogger{})
+
+	config := &lib.Config{
+		Providers: map[schemas.ModelProvider]configstore.ProviderConfig{
+			schemas.CodeBuddyCN: {Keys: []schemas.Key{{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: browserLoginConfig()}}},
+		},
+	}
+	attachBifrostClient(t, config)
+	if err := config.UpdateProviderKeyTokens(context.Background(), schemas.CodeBuddyCN, "key-1", "access-2", "refresh-2", ""); err != nil {
+		t.Fatalf("UpdateProviderKeyTokens: %v", err)
+	}
+
+	replacement := browserLoginConfig()
+	replacement.AccessToken = schemas.NewSecretVar("access-typed")
+	replacement.RefreshToken = schemas.NewSecretVar("refresh-typed")
+	if err := config.UpdateProviderKey(context.Background(), schemas.CodeBuddyCN, "key-1", schemas.Key{
+		ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: replacement,
+	}); err != nil {
+		t.Fatalf("UpdateProviderKey: %v", err)
+	}
+
+	got := storedProviderKey(t, config, "key-1").OAuthKeyConfig
+	if got.RefreshToken.GetValue() != "refresh-typed" || got.AccessToken.GetValue() != "access-typed" {
+		t.Fatalf("an explicit token must overwrite the stored one, got %q/%q", got.AccessToken.GetValue(), got.RefreshToken.GetValue())
 	}
 }

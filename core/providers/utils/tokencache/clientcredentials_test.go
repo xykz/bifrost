@@ -388,4 +388,27 @@ func TestEntryFor(t *testing.T) {
 		assert.WithinDuration(t, time.Now().Add(15*time.Second), e.RefreshAt, 2*time.Second)
 		assert.True(t, e.RefreshAt.Before(expiry))
 	})
+
+	// RefreshAt is exported so a caller holding a token outside the cache makes the same decision
+	// the cache makes; these pin the cases where the two used to disagree. Every case is a token
+	// that has not yet expired, which is the only input entryFor is ever given.
+	t.Run("RefreshAt never leaves a live token due immediately", func(t *testing.T) {
+		now := time.Now()
+		for _, tc := range []struct {
+			name   string
+			expiry time.Time
+			margin time.Duration
+		}{
+			{"long lived", now.Add(time.Hour), DefaultRefreshMargin},
+			{"exactly on the margin boundary", now.Add(DefaultRefreshMargin), DefaultRefreshMargin},
+			{"inside the margin", now.Add(30 * time.Second), DefaultRefreshMargin},
+			{"one second of life", now.Add(time.Second), DefaultRefreshMargin},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				got := RefreshAt(tc.expiry, now, tc.margin)
+				assert.True(t, got.After(now), "a live token must not be due immediately")
+				assert.True(t, !got.After(tc.expiry), "RefreshAt must not outlive the token")
+			})
+		}
+	})
 }

@@ -85,13 +85,23 @@ func entryFor(token string, expiry time.Time, margin time.Duration) *Entry[strin
 	if expiry.IsZero() {
 		expiry = time.Now().Add(fallbackTokenLifetime)
 	}
-	refreshAt := expiry.Add(-margin)
-	if !refreshAt.After(time.Now()) {
-		// A token that is already inside its refresh margin is still usable for its remaining
-		// life; trust it for half of what is left rather than minting on every request.
-		refreshAt = time.Now().Add(time.Until(expiry) / 2)
+	return &Entry[string]{Value: token, ExpiresAt: expiry, RefreshAt: RefreshAt(expiry, time.Now(), margin)}
+}
+
+// RefreshAt returns the moment a token expiring at expiresAt stops being trusted, given margin.
+// A token that is already inside its margin at now is still usable for its remaining life, so it
+// is trusted for half of what is left rather than being treated as due on arrival.
+//
+// It is exported so a caller holding a token outside the cache — a persisted access token, say —
+// makes the same freshness decision the cache makes. Two implementations of the margin arithmetic
+// would drift, and the disagreement shows up as a token that is minted on every request, or one
+// used after the cache would have replaced it.
+func RefreshAt(expiresAt, now time.Time, margin time.Duration) time.Time {
+	refreshAt := expiresAt.Add(-margin)
+	if !refreshAt.After(now) {
+		refreshAt = now.Add(expiresAt.Sub(now) / 2)
 	}
-	return &Entry[string]{Value: token, ExpiresAt: expiry, RefreshAt: refreshAt}
+	return refreshAt
 }
 
 // tokenRequestError maps an x/oauth2 error onto a BifrostError. A RetrieveError carries the

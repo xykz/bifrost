@@ -532,6 +532,20 @@ func decodeKeyUpdate(body []byte, oldRawKey schemas.Key) (schemas.Key, error) {
 	return updateKey, nil
 }
 
+// requireMaskedCounterpart rejects a mask that has no stored value behind it, so a redacted
+// preview can never be persisted as a credential. It does not resolve the mask: the caller does
+// that under the write lock, against the value stored at that moment rather than the one read
+// earlier.
+func requireMaskedCounterpart(incoming, stored *schemas.SecretVar, field string) error {
+	if !incoming.IsMaskedPlaceholder() {
+		return nil
+	}
+	if stored == nil || !stored.IsSet() {
+		return fmt.Errorf("masked preview cannot be used for %s without a stored value", field)
+	}
+	return nil
+}
+
 // mergeUpdatedKey merges an updated key with the old raw version, preserving
 // stored values for masked placeholders. A placeholder without a stored
 // counterpart is rejected so it can never reach persistence.
@@ -770,10 +784,6 @@ func (h *ProviderHandler) mergeUpdatedKey(oldRawKey, updateKey schemas.Key) (sch
 			clientID = old.ClientID
 			clientSecret = old.ClientSecret
 			privateKey = old.PrivateKey
-			// browser_login rotates these at runtime, and a GET masks them like every other
-			// credential. Without these two entries an ordinary save (rename, weight edit) that
-			// echoes the mask would overwrite the fresh tokens with asterisks, and the next
-			// refresh would send the mask upstream as the durable credential.
 			accessToken = old.AccessToken
 			refreshToken = old.RefreshToken
 		}
@@ -786,10 +796,27 @@ func (h *ProviderHandler) mergeUpdatedKey(oldRawKey, updateKey schemas.Key) (sch
 			{mergedKey.OAuthKeyConfig.ClientID, clientID, "oauth_key_config.client_id"},
 			{mergedKey.OAuthKeyConfig.ClientSecret, clientSecret, "oauth_key_config.client_secret"},
 			{mergedKey.OAuthKeyConfig.PrivateKey, privateKey, "oauth_key_config.private_key"},
+		} {
+			if err := preserve(item.incoming, item.stored, item.field); err != nil {
+				return schemas.Key{}, err
+			}
+		}
+		// access_token and refresh_token are deliberately NOT resolved here. They rotate at
+		// runtime, so the value captured at read time is already stale by the time this merge
+		// runs — a refresh may have landed in between, and resolving the mask against the stale
+		// capture would write back the predecessor refresh token that upstream has invalidated.
+		// The mask is carried through and resolved under the write lock instead, against whatever
+		// is stored then (see Config.preserveRotatedOAuthTokens). This still rejects a mask with no
+		// stored counterpart, so a preview can never reach persistence.
+		for _, item := range []struct {
+			incoming *schemas.SecretVar
+			stored   *schemas.SecretVar
+			field    string
+		}{
 			{mergedKey.OAuthKeyConfig.AccessToken, accessToken, "oauth_key_config.access_token"},
 			{mergedKey.OAuthKeyConfig.RefreshToken, refreshToken, "oauth_key_config.refresh_token"},
 		} {
-			if err := preserve(item.incoming, item.stored, item.field); err != nil {
+			if err := requireMaskedCounterpart(item.incoming, item.stored, item.field); err != nil {
 				return schemas.Key{}, err
 			}
 		}

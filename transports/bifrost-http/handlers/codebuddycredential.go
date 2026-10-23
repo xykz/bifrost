@@ -27,23 +27,28 @@ func InstallCodeBuddyCredentialSink(config *lib.Config) {
 	})
 }
 
-// persistRotatedCredential writes a rotation the provider just performed. It deliberately does not
-// return an error to the caller: the mint already succeeded and the request that triggered it is
-// about to be served, so failing it would turn a persistence problem into an inference outage.
-// The loss is loud in the log instead, and the consequence is bounded — the credential degrades to
-// a re-login rather than to a retry storm.
+// persistRotatedCredential hands a rotation the provider just performed to the config store.
 //
-// A refresh runs on the inference path, which is why the write goes through
-// Config.UpdateProviderKeyTokens and not Config.UpdateProviderKey: the latter rebuilds the
-// provider's worker queue, which is right for an operator saving a key and wrong here.
+// This runs on the inference path, and under a token cache mutex: tokencache invokes onRotate while
+// it holds that credential's slot lock (see BrowserLoginMinter's contract), so it must not block.
+// Config.UpdateProviderKeyTokens therefore applies the token to memory synchronously and schedules
+// the row write on a bounded goroutine (lib.TokenPersistTimeout). The request that triggered the
+// mint is served as soon as the in-memory token is visible; the store catching up afterwards
+// changes nothing the caller can observe.
+//
+// The write goes through Config.UpdateProviderKeyTokens and not Config.UpdateProviderKey: the
+// latter rebuilds the provider's worker queue, which is right for an operator saving a key and
+// wrong for a routine refresh. A store failure is logged rather than returned, so a restart after a
+// failed write needs a re-login for that key instead of turning the failure into an inference
+// outage. That durability trade-off is documented on UpdateProviderKeyTokens.
 func persistRotatedCredential(config *lib.Config, provider schemas.ModelProvider, keyID, accessToken, refreshToken, expiresAt string) {
-	// context.Background rather than a request context: the cache runs the mint on a detached
-	// context (tokencache.Cache.Get uses context.WithoutCancel), so the rotation outlives the client
-	// that happened to trigger it, and the write must not be cancelled halfway for the same reason.
-	ctx := context.Background()
-	if err := config.UpdateProviderKeyTokens(ctx, provider, keyID, accessToken, refreshToken, expiresAt); err != nil {
+	// context.Background rather than the request's context: tokencache runs the mint on a context
+	// that already survives client disconnects (context.WithoutCancel), so a rotation must land even
+	// if the client that happened to trigger it hangs up. The background write applies its own
+	// timeout.
+	if err := config.UpdateProviderKeyTokens(context.Background(), provider, keyID, accessToken, refreshToken, expiresAt); err != nil {
 		if logger != nil {
-			logger.Warn("Failed to persist rotated codebuddy-cn credential for key %s of provider %s: %v", keyID, provider, err)
+			logger.Warn("Failed to apply rotated codebuddy-cn credential for key %s of provider %s: %v", keyID, provider, err)
 		}
 	}
 }
