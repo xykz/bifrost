@@ -1,5 +1,7 @@
 import {
 	AddProviderRequest,
+	CodeBuddyLoginStart,
+	CodeBuddyLoginStatus,
 	CreateProviderKeyRequest,
 	ListProviderKeysResponse,
 	ListProvidersResponse,
@@ -442,6 +444,16 @@ export const providersApi = baseApi.injectEndpoints({
 			providesTags: ["DBKeys"],
 		}),
 
+		// CodeBuddy CN browser login. Neither endpoint invalidates a tag: a sign-in does not
+		// change server state until the admin saves the key that carries the tokens.
+		startCodeBuddyLogin: builder.mutation<CodeBuddyLoginStart, { provider: string }>({
+			query: ({ provider }) => ({ url: `/providers/${provider}/codebuddy-cn/login`, method: "POST" }),
+		}),
+
+		getCodeBuddyLoginStatus: builder.query<CodeBuddyLoginStatus, { provider: string; flowId: string }>({
+			query: ({ provider, flowId }) => ({ url: `/providers/${provider}/codebuddy-cn/login/${flowId}` }),
+		}),
+
 		// Get models with optional filtering
 		getModels: builder.query<ListModelsResponse, GetModelsRequest>({
 			query: ({ query, provider, keys, vks, limit, offset, unfiltered, decisions }) => {
@@ -556,4 +568,7 @@ export const {
 	useGetModelDetailsQuery,
 	useLazyGetModelDetailsQuery,
 	useUpsertModelCatalogEntriesMutation,
+	useStartCodeBuddyLoginMutation,
+	useGetCodeBuddyLoginStatusQuery,
+	useLazyGetCodeBuddyLoginStatusQuery,
 } = providersApi;

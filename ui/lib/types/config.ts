@@ -361,6 +361,22 @@ export const DefaultOAuthKeyConfig: OAuthKeyConfig = {
 	_auth_type: "api_key",
 } as const satisfies OAuthKeyConfig;
 
+// CodeBuddyLoginStart is the answer to POST /api/providers/{provider}/codebuddy-cn/login: an
+// opaque flow handle, the browser URL to open, and when the sign-in must finish (RFC3339).
+export type CodeBuddyLoginStart = {
+	flow_id: string;
+	auth_url: string;
+	flow_expires_at: string;
+};
+
+// CodeBuddyLoginStatus is the poll endpoint's answer. `expires_at` on the completed variant is
+// the access token's expiry, not the flow's — that is the value oauth_key_config.expires_at
+// stores, while the flow deadline lives on CodeBuddyLoginStart.
+export type CodeBuddyLoginStatus =
+	| { status: "pending" }
+	| { status: "failed"; error?: string }
+	| { status: "completed"; access_token: string; refresh_token: string; token_type: string; expires_at: string };
+
 // Key structure matching Go's schemas.Key
 export interface ModelProviderKey {
 	id: string;

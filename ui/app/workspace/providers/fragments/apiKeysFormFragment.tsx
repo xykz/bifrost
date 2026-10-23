@@ -1,7 +1,9 @@
+import { Button } from "@/components/ui/button";
 import { ModelAccessSelector } from "@/components/modelAccess";
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
 import { FormControl, FormDescription, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { DefaultVertexAWSWorkloadIdentityConfig, OAuthSigningAlgorithms } from "@/lib/types/config";
+import type { OAuthKeyConfig } from "@/lib/types/config";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { SecretVarInput } from "@/components/ui/secretVarInput";
@@ -12,9 +14,19 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { TagInput } from "@/components/ui/tagInput";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { hasCopilotApiToken, isRedacted } from "@/lib/utils/validation";
-import { Info } from "lucide-react";
+import { formatAbsoluteDateTime } from "@/lib/utils/mcpCredential";
+import { codebuddyCNOAuthComplete } from "@/lib/types/schemas";
+import { Info, LogIn, CheckCircle2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Control, UseFormReturn } from "react-hook-form";
+import {
+	codeBuddyLoginAPIKeyModeConfig,
+	codeBuddyLoginAuthMode,
+	codeBuddyLoginErrorFromForm,
+	codeBuddyLoginOAuthConfig,
+	codeBuddyLoginPendingOAuthConfig,
+} from "../views/codeBuddyLogin";
+import { CodeBuddyLoginModal } from "../views/codeBuddyLoginModal";
 import { DeploymentsTable } from "./deploymentsTable";
 
 // Providers that support batch APIs
@@ -31,6 +43,9 @@ interface Props {
 	// Drives which credential UI renders; falls back to providerName for native providers.
 	baseProviderType?: string;
 	form: UseFormReturn<any>;
+	// The provider's configured gateway host, when it has one. The CodeBuddy browser login
+	// stores its refresh endpoint under this host rather than the public default.
+	baseURL?: string;
 }
 
 // Batch API form field for all providers
@@ -142,7 +157,7 @@ function VPCEndpointsFormField({
 	);
 }
 
-export function ApiKeyFormFragment({ control, providerName, baseProviderType, form }: Props) {
+export function ApiKeyFormFragment({ control, providerName, baseProviderType, form, baseURL }: Props) {
 	// Credential UI keys off the base provider type for custom providers; the
 	// model list, deployments table, and API calls still use the real providerName.
 	const effectiveProvider = baseProviderType ?? providerName;
@@ -159,6 +174,10 @@ export function ApiKeyFormFragment({ control, providerName, baseProviderType, fo
 	const isDatabricks = effectiveProvider === "databricks";
 	const isGithubCopilot = effectiveProvider === "github-copilot";
 	const isCloudflare = effectiveProvider === "cloudflare";
+	// Tencent CodeBuddy (China) has exactly two credentials: a pasted API key or a browser-login
+	// bundle. The backend resolves the sign-in target from the provider's own config, so the
+	// modal takes the real provider name even when this is a custom provider on the base type.
+	const isCodeBuddy = effectiveProvider === "codebuddy-cn";
 	// openai, and every custom provider built on the openai base, may mint its bearer from
 	// oauth_key_config instead of carrying a static API key.
 	const isOpenAICompatible = effectiveProvider === "openai";
@@ -184,6 +203,17 @@ export function ApiKeyFormFragment({ control, providerName, baseProviderType, fo
 	// Auth type state for openai-based keys: a static API key, or an OAuth-minted bearer
 	const [openaiAuthType, setOpenaiAuthType] = useState<"api_key" | "oauth">("api_key");
 	const oauthGrantType = form.watch("key.oauth_key_config.grant_type") ?? "client_credentials";
+
+	// Auth type state for codebuddy-cn keys: a pasted API key, or a browser login
+	const [codeBuddyAuthType, setCodeBuddyAuthType] = useState<"api_key" | "oauth">("api_key");
+	const [codeBuddyLoginOpen, setCodeBuddyLoginOpen] = useState(false);
+	// Reactive so the status row and the sign-in label follow a completed login, and the
+	// saved state on an edit.
+	const codeBuddyOauthConfig = form.watch("key.oauth_key_config") as OAuthKeyConfig | undefined;
+	// The key schema reports a bundle's faults on oauth_key_config / .refresh_token paths, which
+	// have no field on this tab — the bundle is written by the sign-in, not typed. Rendering its
+	// message here is what keeps a refused save from looking like a dead button.
+	const codeBuddyOauthError = codeBuddyLoginErrorFromForm(form.formState.errors);
 
 	// Auth type state for Vertex: 'service_account' (ADC), 'service_account_json', 'api_key', or
 	// 'aws_workload_identity' (GCP Workload Identity Federation from the workload's AWS identity)
@@ -261,6 +291,15 @@ export function ApiKeyFormFragment({ control, providerName, baseProviderType, fo
 		// oauthDefaults re-runs detection after the key form resets itself once the key
 		// resolves, for the same reason as databricksDefaults above.
 	}, [isOpenAICompatible, form, oauthDefaults]);
+
+	const codeBuddyOauthDefaults = form.formState.defaultValues?.key?.oauth_key_config;
+	useEffect(() => {
+		if (form.formState.isDirty) return;
+		if (!isCodeBuddy) return;
+		// A stored key is judged by its credential when the discriminator is absent, since the
+		// form re-seeds that only on mount and after the key resolves.
+		setCodeBuddyAuthType(codeBuddyLoginAuthMode(form.getValues("key.oauth_key_config")));
+	}, [isCodeBuddy, form, codeBuddyOauthDefaults]);
 
 	useEffect(() => {
 		if (form.formState.isDirty) return;
@@ -373,7 +412,7 @@ export function ApiKeyFormFragment({ control, providerName, baseProviderType, fo
 				/>
 			</div>
 			{/* Hide API Key field for providers with dedicated auth tabs */}
-			{!isAzure && !isBedrock && !isBedrockMantle && !isVertex && !isDatabricks && !isOpenAICompatible && (
+			{!isAzure && !isBedrock && !isBedrockMantle && !isVertex && !isDatabricks && !isOpenAICompatible && !isCodeBuddy && (
 				<FormField
 					control={control}
 					name={`key.value`}
@@ -1590,6 +1629,131 @@ export function ApiKeyFormFragment({ control, providerName, baseProviderType, fo
 							)}
 						</>
 					)}
+				</div>
+			)}
+			{isCodeBuddy && (
+				<div className="space-y-4">
+					<Separator className="my-6" />
+					<div className="space-y-2">
+						<FormLabel>Authentication Method</FormLabel>
+						<Tabs
+							value={codeBuddyAuthType}
+							onValueChange={(v) => {
+								const next = v as "api_key" | "oauth";
+								setCodeBuddyAuthType(next);
+								if (next === "oauth") {
+									// One credential per key: the pasted key and the login bundle are
+									// alternatives, never both. Seeding the token URL also lets the form
+									// say "refresh token required" instead of "nothing configured" before
+									// the first sign-in.
+									form.setValue("key.value", { value: "", ref: "" }, { shouldDirty: true });
+									form.setValue("key.oauth_key_config", codeBuddyLoginPendingOAuthConfig(baseURL), {
+										shouldDirty: true,
+										shouldValidate: true,
+									});
+								} else {
+									// Replacing the block is what clears access_token, refresh_token and
+									// expires_at in one write; deleting fields one by one can leave a
+									// bundle the save path still keeps.
+									form.setValue("key.oauth_key_config", codeBuddyLoginAPIKeyModeConfig(), {
+										shouldDirty: true,
+										shouldValidate: true,
+									});
+								}
+							}}
+						>
+							<TabsList className="grid w-full grid-cols-2">
+								<TabsTrigger data-testid="apikey-codebuddy-api-key-tab" value="api_key">
+									API Key
+								</TabsTrigger>
+								<TabsTrigger data-testid="apikey-codebuddy-oauth-tab" value="oauth">
+									OAuth login
+								</TabsTrigger>
+							</TabsList>
+						</Tabs>
+					</div>
+
+					{codeBuddyAuthType === "api_key" && (
+						<FormField
+							control={control}
+							name="key.value"
+							render={({ field }) => (
+								<FormItem>
+									<FormLabel>API Key</FormLabel>
+									<FormDescription>
+										Sent as the X-API-Key header. Sign in with OAuth instead if you were given an account rather than a key.
+									</FormDescription>
+									<FormControl>
+										<SecretVarInput
+											data-testid="key-input-codebuddy-api-key"
+											placeholder="API Key or env.CODEBUDDY_CN_API_KEY"
+											type="text"
+											{...field}
+										/>
+									</FormControl>
+									<FormMessage />
+								</FormItem>
+							)}
+						/>
+					)}
+
+					{codeBuddyAuthType === "oauth" && (
+						<>
+							<p className="text-muted-foreground text-sm">
+								Bifrost opens Tencent&apos;s sign-in page once, keeps the refresh token with this key, and mints a new access token before
+								each expiry. The sign-in is an administrator action: every request this key serves shares it.
+							</p>
+							<div className="rounded-sm border p-3">
+								{codebuddyCNOAuthComplete(codeBuddyOauthConfig) ? (
+									<div className="space-y-1">
+										<p className="flex items-center gap-2 text-sm font-medium" data-testid="apikey-codebuddy-oauth-connected">
+											<CheckCircle2 className="size-4 text-green-600" />
+											Signed in
+										</p>
+										<p className="text-muted-foreground text-xs" data-testid="apikey-codebuddy-oauth-expiry">
+											{codeBuddyOauthConfig?.expires_at
+												? `Access token expires ${formatAbsoluteDateTime(codeBuddyOauthConfig.expires_at)}. It refreshes automatically after that.`
+												: "The access token is fetched on the first request."}
+										</p>
+									</div>
+								) : (
+									<div className="space-y-1">
+										<p className="text-muted-foreground text-sm" data-testid="apikey-codebuddy-oauth-pending">
+											Not signed in yet.
+										</p>
+										<p className="text-muted-foreground text-xs">
+											Sign in to store the token pair with this key. Until then this key has no credential and will not save.
+										</p>
+									</div>
+								)}
+							</div>
+							{codeBuddyOauthError && (
+								<p className="text-destructive text-xs" data-testid="apikey-codebuddy-oauth-error">
+									{codeBuddyOauthError}
+								</p>
+							)}
+							<Button type="button" size="sm" onClick={() => setCodeBuddyLoginOpen(true)} data-testid="apikey-codebuddy-sign-in">
+								<LogIn className="size-3.5" />
+								{codebuddyCNOAuthComplete(codeBuddyOauthConfig) ? "Re-authenticate" : "Sign in"}
+							</Button>
+						</>
+					)}
+
+					<CodeBuddyLoginModal
+						open={codeBuddyLoginOpen}
+						provider={providerName}
+						onOpenChange={setCodeBuddyLoginOpen}
+						onSuccess={(result) => {
+							// A codebuddy key carries exactly one credential: the bundle replaces the
+							// pasted key in the same write, so the live resolver never sees both.
+							form.setValue("key.value", { value: "", ref: "" }, { shouldDirty: true });
+							form.setValue("key.oauth_key_config", codeBuddyLoginOAuthConfig(result, baseURL), {
+								shouldDirty: true,
+								shouldValidate: true,
+							});
+							setCodeBuddyAuthType("oauth");
+						}}
+					/>
 				</div>
 			)}
 			{isGithubCopilot && (
