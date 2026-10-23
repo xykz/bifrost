@@ -229,8 +229,15 @@ export const codebuddyCNOAuthSchema = oauthKeyConfigSchema.safeExtend({
 // bundle. Judging it through the schema means "complete" cannot drift from what the form accepts:
 // a bundle without a refresh token, or with an unparseable expiry, is not usable. The parameter is
 // `unknown` so the login modal can pass a freshly built payload without a cast.
-export const codebuddyCNOAuthComplete = (cfg: unknown): boolean =>
-	!!cfg && typeof cfg === "object" && codebuddyCNOAuthSchema.safeParse(cfg).success;
+//
+// `_auth_type` is dropped first, exactly as the save path does: the shared block's superRefine
+// treats `_auth_type: "api_key"` as an inert placeholder and skips its checks, which would read a
+// half-filled bundle as connected.
+export const codebuddyCNOAuthComplete = (cfg: unknown): boolean => {
+	if (!cfg || typeof cfg !== "object") return false;
+	const { _auth_type: _ignored, ...payload } = cfg as Record<string, unknown>;
+	return payload.grant_type === "browser_login" && codebuddyCNOAuthSchema.safeParse(payload).success;
+};
 
 const KeySchema = z.object({
 	id: z.string(),

@@ -6,6 +6,12 @@ describe("resolveProviderIconKey", () => {
 		expect(resolveProviderIconKey("openai")).toBe("openai");
 	});
 
+	// The icon key is the provider string itself, so a "codebuddy" entry would silently leave
+	// CodeBuddy CN without a mark: resolveProviderIconKey does an exact own-property lookup.
+	it("resolves the codebuddy-cn provider string", () => {
+		expect(resolveProviderIconKey("codebuddy-cn")).toBe("codebuddy-cn");
+	});
+
 	it("falls back to the base provider type for a custom provider", () => {
 		expect(resolveProviderIconKey("my-gateway", "openai")).toBe("openai");
 	});

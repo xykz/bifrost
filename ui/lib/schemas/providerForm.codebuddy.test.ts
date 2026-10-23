@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DefaultNetworkConfig } from "@/lib/constants/config";
-import { ProviderFormSchema } from "./providerForm";
+import { codebuddyCNOAuthComplete, ProviderFormSchema } from "./providerForm";
 
 // A codebuddy-cn key has exactly two auth modes and the server refuses any other combination:
 // a pasted API key (X-API-Key) or a browser_login bundle (Authorization). The form must agree,
@@ -97,5 +97,54 @@ describe("ProviderFormSchema codebuddy-cn credentials", () => {
 			],
 		});
 		expect(other.success, other.success ? "" : JSON.stringify(other.error.issues)).toBe(true);
+	});
+});
+
+// Task 9's form fragment renders "connected" from this predicate and its modal hands the
+// generated bundle back, so it has to agree with the schema above field for field.
+describe("codebuddyCNOAuthComplete", () => {
+	const literal = (value: string) => ({ value, ref: "" });
+	const bundle = (overrides: Record<string, unknown> = {}) => ({
+		grant_type: "browser_login",
+		token_url: literal("https://copilot.tencent.com/v2/plugin/auth/token/refresh"),
+		access_token: literal("access-abc"),
+		refresh_token: literal("refresh-xyz"),
+		expires_at: "2026-10-22T12:00:00Z",
+		...overrides,
+	});
+
+	it("accepts a whole browser-login bundle, with or without an access token", () => {
+		expect(codebuddyCNOAuthComplete(bundle())).toBe(true);
+		// The server mints the first access token from the refresh token, so a bundle straight
+		// out of the login response may not carry one.
+		expect(codebuddyCNOAuthComplete(bundle({ access_token: undefined }))).toBe(true);
+	});
+
+	it("accepts an empty expiry, which means refresh on use", () => {
+		expect(codebuddyCNOAuthComplete(bundle({ expires_at: "" }))).toBe(true);
+		expect(codebuddyCNOAuthComplete(bundle({ expires_at: undefined }))).toBe(true);
+	});
+
+	it("rejects nothing, another grant and an unreadable expiry", () => {
+		expect(codebuddyCNOAuthComplete(undefined)).toBe(false);
+		expect(codebuddyCNOAuthComplete(null)).toBe(false);
+		expect(codebuddyCNOAuthComplete({ ...bundle(), grant_type: "client_credentials" })).toBe(false);
+		expect(codebuddyCNOAuthComplete(bundle({ expires_at: "not a date" }))).toBe(false);
+		expect(codebuddyCNOAuthComplete(bundle({ refresh_token: literal("") }))).toBe(false);
+	});
+});
+// The key form seeds `_auth_type: "api_key"` on mount as the inert placeholder for the API-key
+// tab. The shared schema skips its checks for that value, so completeness must not be fooled by it.
+describe("codebuddyCNOAuthComplete and the inert discriminator", () => {
+	const literal = (value: string) => ({ value, ref: "" });
+
+	it("does not read a placeholder bundle as connected", () => {
+		expect(
+			codebuddyCNOAuthComplete({
+				_auth_type: "api_key",
+				grant_type: "browser_login",
+				token_url: literal("https://copilot.tencent.com/v2/plugin/auth/token/refresh"),
+			}),
+		).toBe(false);
 	});
 });
