@@ -3,10 +3,12 @@ package handlers
 import (
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bytedance/sonic"
@@ -56,6 +58,12 @@ const (
 	// codeBuddyLoginFlowNotFound is the answer for an unknown, foreign, expired or already-dropped
 	// flow. It deliberately does not distinguish between them.
 	codeBuddyLoginFlowNotFound = "codebuddy login flow not found"
+	// codeBuddyLoginStoreFailed is the refusal for a terminal answer the store cannot hold. The
+	// client is not shown the tokens in that case: the server could not reproduce them.
+	codeBuddyLoginStoreFailed = "failed to store the codebuddy login result"
+	// codeBuddyLoginLockStripes bounds the poll locks. Striping keeps the set fixed for the life
+	// of the process, so per-flow serialization costs no bookkeeping and leaks nothing.
+	codeBuddyLoginLockStripes = 64
 )
 
 const (
@@ -68,36 +76,67 @@ const (
 // one that is simply missing from the config.
 var errCodeBuddyLoginWrongProvider = errors.New(codeBuddyLoginWrongProvider)
 
+// codeBuddyLoginFlowLocks serializes polls of one flow on this node; see lockCodeBuddyLoginFlow.
+var codeBuddyLoginFlowLocks [codeBuddyLoginLockStripes]sync.Mutex
+
+// lockCodeBuddyLoginFlow takes this node's lock for a flow and returns its release.
+//
+// Two concurrent polls of a pending flow would otherwise both present the same upstream state. The
+// upstream answers the second with a terminal code (the state is consumed), and without
+// serialization that losing answer could settle over the winning poll's token pair. Holding the
+// lock across the upstream call also stops one browser sign-in from being polled twice at once.
+// It is per node: a peer replica can still race, which is why finishCodeBuddyLogin re-reads the
+// record before writing.
+func lockCodeBuddyLoginFlow(flowID string) func() {
+	hash := fnv.New32a()
+	_, _ = hash.Write([]byte(flowID))
+	lock := &codeBuddyLoginFlowLocks[hash.Sum32()%codeBuddyLoginLockStripes]
+	lock.Lock()
+	return lock.Unlock
+}
+
 // codeBuddyLoginFlow is a login in progress, as stored in the shared KV store.
 //
-// The upstream state never leaves the server: it is what finishes the flow, so a client holding
-// it could impersonate the browser that was opened. flow_id is the opaque handle handed out
-// instead, and it is the store key's suffix rather than a field here.
+// The upstream state is a credential in its own right: whoever presents it can finish the flow and
+// collect the browser's tokens. It therefore appears outside this record only inside auth_url,
+// which is the upstream URL the admin opens. flow_id is the opaque handle handed out instead, and
+// it is the store key's suffix rather than a field here.
+//
+// ExpiresAt and TokenExpiresAt are different clocks and must not be confused: the first is when the
+// browser must finish (and, once settled, when this entry stops being pollable), the second is when
+// the access token the browser minted will need refreshing.
 type codeBuddyLoginFlow struct {
 	State          string                `json:"state"`                      // Upstream device-flow state, server-side only
 	Provider       schemas.ModelProvider `json:"provider"`                   // Provider the flow was started for
-	ExpiresAt      string                `json:"expires_at"`                 // Deadline for the browser to finish, RFC3339
+	ExpiresAt      string                `json:"expires_at"`                 // Flow deadline, RFC3339
 	Status         string                `json:"status"`                     // pending, completed or failed
 	AccessToken    string                `json:"access_token,omitempty"`     // Completed only
 	RefreshToken   string                `json:"refresh_token,omitempty"`    // Completed only
+	TokenType      string                `json:"token_type,omitempty"`       // Completed only, as the upstream reported it
 	TokenExpiresAt string                `json:"token_expires_at,omitempty"` // Completed only, access-token expiry RFC3339
 	Error          string                `json:"error,omitempty"`            // Failed only
 }
 
-// codeBuddyLoginStartResponse is the start endpoint's wire shape. It carries the flow handle and
-// the URL to open, never the upstream state behind them.
+// codeBuddyLoginStartResponse is the start endpoint's wire shape.
+//
+// flow_expires_at is the deadline for the browser to finish the sign-in. It is deliberately not
+// called expires_at: the completed poll uses expires_at for the access token's expiry, which is the
+// value oauth_key_config.expires_at stores, and the two must never be written into one field.
 type codeBuddyLoginStartResponse struct {
-	FlowID    string `json:"flow_id"`    // Opaque handle to poll with
-	AuthURL   string `json:"auth_url"`   // Browser URL the admin opens
-	ExpiresAt string `json:"expires_at"` // When the flow stops being pollable, RFC3339
+	FlowID        string `json:"flow_id"`         // Opaque handle to poll with
+	AuthURL       string `json:"auth_url"`        // Browser URL the admin opens
+	FlowExpiresAt string `json:"flow_expires_at"` // When the browser must finish, RFC3339
 }
 
 // codeBuddyLoginStatusResponse is the poll endpoint's wire shape, identical for every state.
+//
+// expires_at here is the access token's expiry, not the flow's: it is what the key form stores.
 type codeBuddyLoginStatusResponse struct {
 	Status       string `json:"status"`                  // pending, completed or failed
 	AccessToken  string `json:"access_token,omitempty"`  // Completed only
 	RefreshToken string `json:"refresh_token,omitempty"` // Completed only
-	ExpiresAt    string `json:"expires_at,omitempty"`    // Completed only, RFC3339
+	TokenType    string `json:"token_type,omitempty"`    // Completed only
+	ExpiresAt    string `json:"expires_at,omitempty"`    // Completed only, access-token expiry RFC3339
 	Error        string `json:"error,omitempty"`         // Failed only
 }
 
@@ -126,6 +165,7 @@ type codeBuddyDeviceTokenResponse struct {
 // a hand-constructed lib.Config (tests, embedded use) looks like. The live factory is preferred
 // so the flow honours the deployment's proxy settings.
 var codeBuddyLoginFallbackClient = &http.Client{
+	Transport:     http.DefaultTransport,
 	Timeout:       codeBuddyLoginRequestTimeout,
 	CheckRedirect: refuseCodeBuddyLoginRedirect,
 }
@@ -152,14 +192,16 @@ func (h *ProviderHandler) startCodeBuddyLogin(ctx *fasthttp.RequestCtx) {
 		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("invalid provider: %v", err))
 		return
 	}
-	kv, err := h.codeBuddyLoginStore()
-	if err != nil {
-		SendError(ctx, fasthttp.StatusInternalServerError, err.Error())
-		return
-	}
+	// Provider validation comes before the store check: a bogus provider must be a 404 on every
+	// deployment, including one whose store failed to initialise, rather than a misleading 500.
 	baseURL, err := h.codeBuddyLoginBaseURL(provider)
 	if err != nil {
 		sendCodeBuddyLoginTargetError(ctx, err)
+		return
+	}
+	kv, err := h.codeBuddyLoginStore()
+	if err != nil {
+		SendError(ctx, fasthttp.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -191,9 +233,9 @@ func (h *ProviderHandler) startCodeBuddyLogin(ctx *fasthttp.RequestCtx) {
 	}
 
 	SendJSON(ctx, codeBuddyLoginStartResponse{
-		FlowID:    flowID,
-		AuthURL:   state.AuthURL,
-		ExpiresAt: flow.ExpiresAt,
+		FlowID:        flowID,
+		AuthURL:       state.AuthURL,
+		FlowExpiresAt: flow.ExpiresAt,
 	})
 }
 
@@ -217,11 +259,22 @@ func (h *ProviderHandler) pollCodeBuddyLogin(ctx *fasthttp.RequestCtx) {
 		SendError(ctx, fasthttp.StatusBadRequest, "missing flow id")
 		return
 	}
+	// Resolve the provider before the store, for the same reason start does: a bogus provider is a
+	// 404 on every deployment, not a 500 blaming the store. The result is reused for the upstream
+	// call below, so this costs nothing extra.
+	baseURL, err := h.codeBuddyLoginBaseURL(provider)
+	if err != nil {
+		sendCodeBuddyLoginTargetError(ctx, err)
+		return
+	}
 	kv, err := h.codeBuddyLoginStore()
 	if err != nil {
 		SendError(ctx, fasthttp.StatusInternalServerError, err.Error())
 		return
 	}
+
+	release := lockCodeBuddyLoginFlow(flowID)
+	defer release()
 
 	flow, err := loadCodeBuddyLoginFlow(kv, flowID)
 	if err != nil || flow.Provider != provider {
@@ -239,16 +292,11 @@ func (h *ProviderHandler) pollCodeBuddyLogin(ctx *fasthttp.RequestCtx) {
 		SendError(ctx, fasthttp.StatusNotFound, codeBuddyLoginFlowNotFound)
 		return
 	}
-	if flow.Status == codeBuddyLoginCompleted || flow.Status == codeBuddyLoginFailed {
+	if codeBuddyLoginTerminal(flow.Status) {
 		SendJSON(ctx, codeBuddyLoginStatusOf(flow))
 		return
 	}
 
-	baseURL, err := h.codeBuddyLoginBaseURL(provider)
-	if err != nil {
-		sendCodeBuddyLoginTargetError(ctx, err)
-		return
-	}
 	upstreamURL := baseURL + codeBuddyLoginTokenPath + "?" + url.Values{"state": {flow.State}}.Encode()
 	body, err := h.codeBuddyLoginCall(ctx, http.MethodGet, upstreamURL)
 	if err != nil {
@@ -260,7 +308,7 @@ func (h *ProviderHandler) pollCodeBuddyLogin(ctx *fasthttp.RequestCtx) {
 	}
 	var polled codeBuddyDeviceTokenResponse
 	if err := sonic.Unmarshal(body, &polled); err != nil {
-		settleCodeBuddyLogin(ctx, kv, flowID, flow, codeBuddyLoginFailed, "codebuddy login received an unexpected answer from the provider")
+		h.finishCodeBuddyLogin(ctx, kv, flowID, failedCodeBuddyLogin(flow, "codebuddy login received an unexpected answer from the provider"))
 		return
 	}
 
@@ -269,13 +317,14 @@ func (h *ProviderHandler) pollCodeBuddyLogin(ctx *fasthttp.RequestCtx) {
 		SendJSON(ctx, codeBuddyLoginStatusResponse{Status: codeBuddyLoginPending})
 	case 0:
 		if polled.Data == nil || polled.Data.AccessToken == "" || polled.Data.RefreshToken == "" {
-			settleCodeBuddyLogin(ctx, kv, flowID, flow, codeBuddyLoginFailed, "codebuddy login succeeded without a token pair")
+			h.finishCodeBuddyLogin(ctx, kv, flowID, failedCodeBuddyLogin(flow, "codebuddy login succeeded without a token pair"))
 			return
 		}
 		settled := *flow
 		settled.Status = codeBuddyLoginCompleted
 		settled.AccessToken = polled.Data.AccessToken
 		settled.RefreshToken = polled.Data.RefreshToken
+		settled.TokenType = polled.Data.TokenType
 		if polled.Data.ExpiresIn > 0 {
 			settled.TokenExpiresAt = time.Now().Add(time.Duration(polled.Data.ExpiresIn) * time.Second).UTC().Format(time.RFC3339)
 		}
@@ -286,44 +335,76 @@ func (h *ProviderHandler) pollCodeBuddyLogin(ctx *fasthttp.RequestCtx) {
 		// deadline with it keeps the stored lifetime and the expiry check telling the same story,
 		// so a sign-in that completes at minute 14 is still readable for its five minutes.
 		settled.ExpiresAt = time.Now().Add(codeBuddyLoginSettledTTL).UTC().Format(time.RFC3339)
-		if err := kv.SetWithTTL(codeBuddyLoginKey(flowID), &settled, codeBuddyLoginSettledTTL); err != nil {
-			logger.Warn("failed to settle codebuddy login flow: %v", err)
-		}
-		SendJSON(ctx, codeBuddyLoginStatusOf(&settled))
+		h.finishCodeBuddyLogin(ctx, kv, flowID, &settled)
 	default:
 		// The upstream said no in its own words. Its message is not forwarded: it is upstream
 		// text, and the state it was asked about must not travel back to a client in any form.
-		settleCodeBuddyLogin(ctx, kv, flowID, flow, codeBuddyLoginFailed,
-			fmt.Sprintf("codebuddy login was refused by the provider (code %d)", polled.Code))
+		h.finishCodeBuddyLogin(ctx, kv, flowID, failedCodeBuddyLogin(flow,
+			fmt.Sprintf("codebuddy login was refused by the provider (code %d)", polled.Code)))
 	}
 }
 
-// settleCodeBuddyLogin writes a terminal answer back so every later poll reads it without an
-// upstream call, and returns it. The write uses the settled TTL, not the pending one.
-func settleCodeBuddyLogin(ctx *fasthttp.RequestCtx, kv schemas.KVStore, flowID string, flow *codeBuddyLoginFlow, status, message string) {
+// failedCodeBuddyLogin projects a flow onto its terminal failure record. The token fields and the
+// state are cleared: a failed flow can never complete, so neither has any further use.
+func failedCodeBuddyLogin(flow *codeBuddyLoginFlow, message string) *codeBuddyLoginFlow {
 	settled := *flow
-	settled.Status = status
+	settled.Status = codeBuddyLoginFailed
 	settled.Error = message
 	settled.AccessToken = ""
 	settled.RefreshToken = ""
+	settled.TokenType = ""
 	settled.TokenExpiresAt = ""
-	// A failed flow cannot complete, so the state that would finish it has no further use.
 	settled.State = ""
 	settled.ExpiresAt = time.Now().Add(codeBuddyLoginSettledTTL).UTC().Format(time.RFC3339)
-	if err := kv.SetWithTTL(codeBuddyLoginKey(flowID), &settled, codeBuddyLoginSettledTTL); err != nil {
-		logger.Warn("failed to settle codebuddy login flow: %v", err)
+	return &settled
+}
+
+// finishCodeBuddyLogin persists a terminal flow and answers with the outcome that actually won.
+//
+// The store has no compare-and-set, so a write cannot be made atomic with the earlier read. Two
+// things narrow the gap. Polls of one flow are serialized on this node (lockCodeBuddyLoginFlow), so
+// the local interleaving cannot happen at all. After that, a peer replica may still have settled
+// the same flow, so this re-reads before writing and refuses to overwrite a terminal record: the
+// first settlement wins, and this poll returns the winner's payload rather than its own losing one.
+//
+// If that re-read fails the write is skipped — overwriting blind is exactly how a token pair would
+// be destroyed — and the request answers 500 instead of handing out credentials the store may not
+// hold. A failed write gets the same treatment for the same reason.
+func (h *ProviderHandler) finishCodeBuddyLogin(ctx *fasthttp.RequestCtx, kv schemas.KVStore, flowID string, settled *codeBuddyLoginFlow) {
+	current, err := loadCodeBuddyLoginFlow(kv, flowID)
+	if err != nil {
+		logger.Warn("failed to re-read codebuddy login flow before settling: %v", err)
+		SendError(ctx, fasthttp.StatusInternalServerError, codeBuddyLoginStoreFailed)
+		return
 	}
-	SendJSON(ctx, codeBuddyLoginStatusOf(&settled))
+	if codeBuddyLoginTerminal(current.Status) {
+		// Another poll settled first. Its record is the truth the client must see; writing this
+		// poll's answer over it would erase the tokens the browser just minted.
+		SendJSON(ctx, codeBuddyLoginStatusOf(current))
+		return
+	}
+	if err := kv.SetWithTTL(codeBuddyLoginKey(flowID), settled, codeBuddyLoginSettledTTL); err != nil {
+		logger.Warn("failed to settle codebuddy login flow: %v", err)
+		SendError(ctx, fasthttp.StatusInternalServerError, codeBuddyLoginStoreFailed)
+		return
+	}
+	SendJSON(ctx, codeBuddyLoginStatusOf(settled))
+}
+
+// codeBuddyLoginTerminal reports whether a status is final.
+func codeBuddyLoginTerminal(status string) bool {
+	return status == codeBuddyLoginCompleted || status == codeBuddyLoginFailed
 }
 
 // codeBuddyLoginStatusOf projects a stored flow onto the poll response. Fields the flow does not
 // carry are omitted rather than serialized empty, and expires_at is the access token's expiry —
-// the flow's own deadline is already reported by the start response.
+// the flow's own deadline is reported once, by the start response.
 func codeBuddyLoginStatusOf(flow *codeBuddyLoginFlow) codeBuddyLoginStatusResponse {
 	return codeBuddyLoginStatusResponse{
 		Status:       flow.Status,
 		AccessToken:  flow.AccessToken,
 		RefreshToken: flow.RefreshToken,
+		TokenType:    flow.TokenType,
 		ExpiresAt:    flow.TokenExpiresAt,
 		Error:        flow.Error,
 	}
@@ -408,18 +489,15 @@ func (h *ProviderHandler) codeBuddyLoginCall(ctx *fasthttp.RequestCtx, method, u
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, method, upstreamURL, nil)
 	if err != nil {
-		return nil, err
+		// NewRequestWithContext wraps its error in a *url.Error carrying the URL, and the poll
+		// URL's query is the upstream state. A malformed configured base_url must not put that
+		// into a log line or a shipped log store.
+		return nil, unwrapCodeBuddyLoginURLError(err)
 	}
 	req.Header.Set("Accept", "application/json")
 	resp, err := h.codeBuddyLoginHTTPClient().Do(req)
 	if err != nil {
-		// A *url.Error carries the full URL, and the poll URL's query is the upstream state. Strip
-		// it so a transport failure cannot put the state into a log line or a shipped log store.
-		var urlErr *url.Error
-		if errors.As(err, &urlErr) && urlErr.Err != nil {
-			return nil, urlErr.Err
-		}
-		return nil, err
+		return nil, unwrapCodeBuddyLoginURLError(err)
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, resp.Body)
@@ -433,6 +511,15 @@ func (h *ProviderHandler) codeBuddyLoginCall(ctx *fasthttp.RequestCtx, method, u
 		return nil, err
 	}
 	return body, nil
+}
+
+// unwrapCodeBuddyLoginURLError drops the *url.Error wrapper, which quotes the request URL.
+func unwrapCodeBuddyLoginURLError(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Err != nil {
+		return urlErr.Err
+	}
+	return err
 }
 
 // codeBuddyLoginHTTPClient builds the client for one upstream call. It borrows the config's live

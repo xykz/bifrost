@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -23,17 +24,21 @@ import (
 // codeBuddyLoginStartBody mirrors the start response the UI consumes. It is declared here
 // rather than reusing the handler's type so these tests also compile before the handler exists,
 // which is what makes the first run fail on routing instead of on a build error.
+//
+// flow_expires_at is the browser's deadline. There is deliberately no expires_at field: that name
+// belongs to the completed poll, where it is the access token's expiry.
 type codeBuddyLoginStartBody struct {
-	FlowID    string `json:"flow_id"`
-	AuthURL   string `json:"auth_url"`
-	ExpiresAt string `json:"expires_at"`
+	FlowID        string `json:"flow_id"`
+	AuthURL       string `json:"auth_url"`
+	FlowExpiresAt string `json:"flow_expires_at"`
 }
 
-// codeBuddyLoginStatusBody mirrors the poll response.
+// codeBuddyLoginStatusBody mirrors the poll response. expires_at is the access token's expiry.
 type codeBuddyLoginStatusBody struct {
 	Status       string `json:"status"`
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
+	TokenType    string `json:"token_type"`
 	ExpiresAt    string `json:"expires_at"`
 	Error        string `json:"error"`
 }
@@ -41,13 +46,19 @@ type codeBuddyLoginStatusBody struct {
 // codeBuddyLoginFixture serves the provider routes over an in-memory listener, so a test
 // exercises the real router, the real path parameters and the real JSON encoding.
 type codeBuddyLoginFixture struct {
-	kv     *kvstore.Store
-	client *fasthttp.Client
+	kv      *kvstore.Store
+	client  *fasthttp.Client
+	config  *lib.Config
+	handler *ProviderHandler
 }
 
 func newCodeBuddyLoginFixture(t *testing.T, upstreamBaseURL string, middlewares ...schemas.BifrostHTTPMiddleware) *codeBuddyLoginFixture {
 	t.Helper()
+	// The logger is a package global; leaving the mock installed would leak into every later test
+	// in this package.
+	previousLogger := logger
 	SetLogger(&mockLogger{})
+	t.Cleanup(func() { SetLogger(previousLogger) })
 
 	store, err := kvstore.New(kvstore.Config{})
 	if err != nil {
@@ -66,8 +77,9 @@ func newCodeBuddyLoginFixture(t *testing.T, upstreamBaseURL string, middlewares 
 		KVStore: store,
 	}
 
+	handler := &ProviderHandler{inMemoryStore: config}
 	r := router.New()
-	(&ProviderHandler{inMemoryStore: config}).RegisterRoutes(r, middlewares...)
+	handler.RegisterRoutes(r, middlewares...)
 
 	server := &fasthttp.Server{Handler: r.Handler}
 	listener := fasthttputil.NewInmemoryListener()
@@ -79,7 +91,9 @@ func newCodeBuddyLoginFixture(t *testing.T, upstreamBaseURL string, middlewares 
 	})
 
 	return &codeBuddyLoginFixture{
-		kv: store,
+		kv:      store,
+		config:  config,
+		handler: handler,
 		client: &fasthttp.Client{
 			Dial:         func(string) (net.Conn, error) { return listener.Dial() },
 			ReadTimeout:  5 * time.Second,
@@ -116,7 +130,15 @@ type fakeCodeBuddyUpstream struct {
 	tokenCalls           int
 	pendingBeforeSuccess int
 	failureCode          int
-	tokenState           string
+	// failAfterFirstSuccess makes the second and later token polls answer terminal, which models
+	// what a real upstream does once the state has been consumed by the winning poll.
+	failAfterFirstSuccess bool
+	// holdFirstToken blocks the first token poll until gate is closed or drained.
+	holdFirstToken chan struct{}
+	// activeTokens and maxActiveTokens record how many token polls the upstream saw at once.
+	activeTokens    int
+	maxActiveTokens int
+	tokenState      string
 }
 
 func newFakeCodeBuddyUpstream(t *testing.T, pendingPolls int) *fakeCodeBuddyUpstream {
@@ -143,24 +165,7 @@ func newFakeCodeBuddyUpstreamWithFailure(t *testing.T, pendingPolls, failureCode
 			}
 			_, _ = w.Write([]byte(`{"state":"s1","authUrl":"https://copilot.tencent.com/login?platform=CLI&state=s1"}`))
 		case "/v2/plugin/auth/token":
-			f.mu.Lock()
-			f.tokenCalls++
-			f.tokenState = r.URL.Query().Get("state")
-			pending := f.pendingBeforeSuccess
-			if pending > 0 {
-				f.pendingBeforeSuccess--
-			}
-			failure := f.failureCode
-			f.mu.Unlock()
-			if failure != 0 {
-				_, _ = w.Write([]byte(fmt.Sprintf(`{"code":%d,"message":"refused"}`, failure)))
-				return
-			}
-			if pending > 0 {
-				_, _ = w.Write([]byte(`{"code":11217}`))
-				return
-			}
-			_, _ = w.Write([]byte(`{"code":0,"data":{"accessToken":"access-1","refreshToken":"refresh-1","expiresIn":3600,"tokenType":"Bearer"}}`))
+			f.answerTokenPoll(w, r)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 			_, _ = w.Write([]byte(`{"code":404}`))
@@ -168,6 +173,49 @@ func newFakeCodeBuddyUpstreamWithFailure(t *testing.T, pendingPolls, failureCode
 	}))
 	t.Cleanup(f.server.Close)
 	return f
+}
+
+// answerTokenPoll serves one token poll, recording concurrency so a test can prove the endpoints
+// never present one state to the upstream twice at once.
+func (f *fakeCodeBuddyUpstream) answerTokenPoll(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	f.tokenCalls++
+	callNumber := f.tokenCalls
+	f.tokenState = r.URL.Query().Get("state")
+	pending := f.pendingBeforeSuccess
+	if pending > 0 {
+		f.pendingBeforeSuccess--
+	}
+	failure := f.failureCode
+	failLater := f.failAfterFirstSuccess && callNumber > 1
+	gate := f.holdFirstToken
+	f.activeTokens++
+	if f.activeTokens > f.maxActiveTokens {
+		f.maxActiveTokens = f.activeTokens
+	}
+	f.mu.Unlock()
+	defer func() {
+		f.mu.Lock()
+		f.activeTokens--
+		f.mu.Unlock()
+	}()
+
+	if gate != nil && callNumber == 1 {
+		<-gate
+	}
+	if failure != 0 || failLater {
+		code := failure
+		if code == 0 {
+			code = 40901
+		}
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"code":%d,"message":"refused"}`, code)))
+		return
+	}
+	if pending > 0 {
+		_, _ = w.Write([]byte(`{"code":11217}`))
+		return
+	}
+	_, _ = w.Write([]byte(`{"code":0,"data":{"accessToken":"access-1","refreshToken":"refresh-1","expiresIn":3600,"tokenType":"Bearer"}}`))
 }
 
 func (f *fakeCodeBuddyUpstream) counts() (state, token int, stateParam string) {
@@ -203,6 +251,16 @@ func mustParseCodeBuddyTime(t *testing.T, value string) time.Time {
 	return parsed
 }
 
+// startCodeBuddyLoginOn drives the start endpoint and returns the decoded body.
+func startCodeBuddyLoginOn(t *testing.T, fixture *codeBuddyLoginFixture, provider string) codeBuddyLoginStartBody {
+	t.Helper()
+	status, body := fixture.do(t, fasthttp.MethodPost, "/api/providers/"+provider+"/codebuddy-cn/login", "{}")
+	if status != fasthttp.StatusOK {
+		t.Fatalf("start status = %d, want 200; body=%s", status, body)
+	}
+	return decodeCodeBuddyLoginStart(t, body)
+}
+
 // TestCodeBuddyLoginStartRequiresAdminSession pins requirement 3: a deployment with dashboard
 // auth disabled must not offer an unauthenticated path to mint a credential.
 func TestCodeBuddyLoginStartRequiresAdminSession(t *testing.T) {
@@ -225,6 +283,31 @@ func TestCodeBuddyLoginStartRequiresAdminSession(t *testing.T) {
 	}
 	if stateCalls, _, _ := upstream.counts(); stateCalls != 0 {
 		t.Fatalf("upstream state called %d times, want 0: a refused login must not dial out", stateCalls)
+	}
+}
+
+// TestCodeBuddyLoginPollRequiresAdminSession pins the poll route's own gate. It is a second
+// handler, so passing the start test says nothing about it.
+func TestCodeBuddyLoginPollRequiresAdminSession(t *testing.T) {
+	upstream := newFakeCodeBuddyUpstream(t, 0)
+	bypassed := func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
+		return func(ctx *fasthttp.RequestCtx) {
+			ctx.SetUserValue(schemas.BifrostContextKeyAuthBypassed, true)
+			next(ctx)
+		}
+	}
+	fixture := newCodeBuddyLoginFixture(t, upstream.server.URL, bypassed)
+
+	status, body := fixture.do(t, fasthttp.MethodGet, "/api/providers/codebuddy-cn/codebuddy-cn/login/any-flow", "")
+	if status != fasthttp.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body=%s", status, body)
+	}
+	const want = "codebuddy login requires an authenticated admin session; enable dashboard authentication first"
+	if !strings.Contains(body, want) {
+		t.Fatalf("body = %q, want it to carry %q", body, want)
+	}
+	if _, tokenCalls, _ := upstream.counts(); tokenCalls != 0 {
+		t.Fatalf("upstream token polled %d times, want 0: a refused poll must not dial out", tokenCalls)
 	}
 }
 
@@ -251,10 +334,15 @@ func TestCodeBuddyLoginFlowTransitions(t *testing.T) {
 	if strings.Contains(body, `"state":`) {
 		t.Fatalf("start body %q exposed a state field", body)
 	}
-	if _, err := time.Parse(time.RFC3339, started.ExpiresAt); err != nil {
-		t.Fatalf("expires_at = %q is not RFC3339: %v", started.ExpiresAt, err)
+	// The start deadline must not be called expires_at: that key is the token expiry on the poll,
+	// and a UI writing it into oauth_key_config.expires_at would store a 15-minute key.
+	if strings.Contains(body, `"expires_at"`) {
+		t.Fatalf("start body %q reused expires_at for the flow deadline", body)
 	}
-	if flowDelta := time.Until(mustParseCodeBuddyTime(t, started.ExpiresAt)); flowDelta < 14*time.Minute || flowDelta > 16*time.Minute {
+	if _, err := time.Parse(time.RFC3339, started.FlowExpiresAt); err != nil {
+		t.Fatalf("flow_expires_at = %q is not RFC3339: %v", started.FlowExpiresAt, err)
+	}
+	if flowDelta := time.Until(mustParseCodeBuddyTime(t, started.FlowExpiresAt)); flowDelta < 14*time.Minute || flowDelta > 16*time.Minute {
 		t.Fatalf("pending flow expires in %v, want the 15 minute window", flowDelta)
 	}
 	if stateCalls, _, _ := upstream.counts(); stateCalls != 1 {
@@ -274,6 +362,9 @@ func TestCodeBuddyLoginFlowTransitions(t *testing.T) {
 		if pending.AccessToken != "" || pending.RefreshToken != "" {
 			t.Fatalf("poll %d returned tokens before the browser completed: %s", i+1, body)
 		}
+		if strings.Contains(body, `"expires_at"`) {
+			t.Fatalf("pending poll %q carried an expires_at, which the UI would read as a token expiry", body)
+		}
 	}
 
 	status, body = fixture.do(t, fasthttp.MethodGet, pollPath, "")
@@ -286,6 +377,12 @@ func TestCodeBuddyLoginFlowTransitions(t *testing.T) {
 	}
 	if completed.AccessToken != "access-1" || completed.RefreshToken != "refresh-1" {
 		t.Fatalf("tokens = %q/%q, want access-1/refresh-1", completed.AccessToken, completed.RefreshToken)
+	}
+	if completed.TokenType != "Bearer" {
+		t.Fatalf("token_type = %q, want the upstream's Bearer", completed.TokenType)
+	}
+	if strings.Contains(body, `"flow_expires_at"`) {
+		t.Fatalf("completed poll %q carried the flow deadline; that key belongs to the start response", body)
 	}
 	tokenExpiry, err := time.Parse(time.RFC3339, completed.ExpiresAt)
 	if err != nil {
@@ -365,6 +462,46 @@ func TestCodeBuddyLoginEndpointIsNotCallerDialable(t *testing.T) {
 	}
 }
 
+// TestCodeBuddyLoginFlowIsBoundToItsProvider pins that a flow started for codebuddy-cn cannot be
+// finished (or read) through another provider's path segment.
+func TestCodeBuddyLoginFlowIsBoundToItsProvider(t *testing.T) {
+	upstream := newFakeCodeBuddyUpstream(t, 0)
+	fixture := newCodeBuddyLoginFixture(t, upstream.server.URL)
+	// A second provider that is also a CodeBuddy implementation, so the path is refused by the
+	// flow's own binding rather than by the provider-type check.
+	fixture.config.Mu.Lock()
+	fixture.config.Providers["codebuddy-cn-other"] = configstore.ProviderConfig{
+		CustomProviderConfig: &schemas.CustomProviderConfig{BaseProviderType: schemas.CodeBuddyCN},
+		NetworkConfig:        &schemas.NetworkConfig{BaseURL: upstream.server.URL},
+	}
+	fixture.config.Mu.Unlock()
+
+	started := startCodeBuddyLoginOn(t, fixture, "codebuddy-cn")
+	status, body := fixture.do(t, fasthttp.MethodGet, "/api/providers/codebuddy-cn-other/codebuddy-cn/login/"+started.FlowID, "")
+	if status != fasthttp.StatusNotFound {
+		t.Fatalf("cross-provider poll status = %d, want 404; body=%s", status, body)
+	}
+	if _, tokenCalls, _ := upstream.counts(); tokenCalls != 0 {
+		t.Fatalf("upstream token polled %d times, want 0: a foreign provider must not finish the flow", tokenCalls)
+	}
+	stored, err := fixture.kv.Get("codebuddy:login:" + started.FlowID)
+	if err != nil {
+		t.Fatalf("flow vanished after a refused cross-provider poll: %v", err)
+	}
+	if flow, ok := stored.(*codeBuddyLoginFlow); !ok || flow.Status != codeBuddyLoginPending {
+		t.Fatalf("a refused cross-provider poll changed the flow: %#v", stored)
+	}
+
+	// The flow is still usable through the provider that started it.
+	status, body = fixture.do(t, fasthttp.MethodGet, "/api/providers/codebuddy-cn/codebuddy-cn/login/"+started.FlowID, "")
+	if status != fasthttp.StatusOK {
+		t.Fatalf("own-provider poll status = %d, want 200; body=%s", status, body)
+	}
+	if got := decodeCodeBuddyLoginStatus(t, body); got.Status != "completed" {
+		t.Fatalf("own-provider poll status = %q, want completed", got.Status)
+	}
+}
+
 // TestCodeBuddyLoginRefusedFlowIsTerminal covers the third state: an upstream refusal settles the
 // flow as failed, carries no tokens, and is not retried upstream by later polls.
 func TestCodeBuddyLoginRefusedFlowIsTerminal(t *testing.T) {
@@ -420,6 +557,271 @@ func TestCodeBuddyLoginRefusedFlowIsTerminal(t *testing.T) {
 	}
 	if failedFlow.State != "" {
 		t.Fatalf("failed flow still carries the upstream state %q", failedFlow.State)
+	}
+}
+
+// TestCodeBuddyLoginLosingSettleKeepsCompletedTokens forces the interleaving directly: a poll has
+// already read a pending flow, a second poll completes it, and only then does the first try to
+// settle as failed. Most of the way there is the local per-flow lock, but a peer replica is outside
+// it, so the finished writer's answer must not be overwritten.
+func TestCodeBuddyLoginLosingSettleKeepsCompletedTokens(t *testing.T) {
+	upstream := newFakeCodeBuddyUpstream(t, 0)
+	fixture := newCodeBuddyLoginFixture(t, upstream.server.URL)
+	started := startCodeBuddyLoginOn(t, fixture, "codebuddy-cn")
+
+	// The stale copy a racing poll would be holding: read while the flow was still pending.
+	stale, err := loadCodeBuddyLoginFlow(fixture.kv, started.FlowID)
+	if err != nil {
+		t.Fatalf("load pending flow: %v", err)
+	}
+	if stale.Status != codeBuddyLoginPending {
+		t.Fatalf("setup: flow status is %q, want pending", stale.Status)
+	}
+
+	// The winning poll completes through the real endpoint, so the stored record is exactly what
+	// a browser sign-in produces.
+	status, body := fixture.do(t, fasthttp.MethodGet, "/api/providers/codebuddy-cn/codebuddy-cn/login/"+started.FlowID, "")
+	if status != fasthttp.StatusOK {
+		t.Fatalf("winning poll status = %d, want 200; body=%s", status, body)
+	}
+	winner := decodeCodeBuddyLoginStatus(t, body)
+	if winner.Status != "completed" || winner.AccessToken != "access-1" {
+		t.Fatalf("winning poll = %+v, want the completed token pair", winner)
+	}
+
+	// The losing poll settles its stale copy as failed. It must observe the winner and answer with
+	// the winner's payload instead of blanking the tokens.
+	losingCtx := &fasthttp.RequestCtx{}
+	fixture.handler.finishCodeBuddyLogin(losingCtx, fixture.kv, started.FlowID,
+		failedCodeBuddyLogin(stale, "codebuddy login was refused by the provider (code 40901)"))
+	if got := losingCtx.Response.StatusCode(); got != fasthttp.StatusOK {
+		t.Fatalf("losing settle status = %d, want 200 with the winner's payload; body=%s", got, losingCtx.Response.Body())
+	}
+	losing := decodeCodeBuddyLoginStatus(t, string(losingCtx.Response.Body()))
+	if losing != winner {
+		t.Fatalf("losing settle returned %+v, want the winner's payload %+v", losing, winner)
+	}
+
+	stored, err := loadCodeBuddyLoginFlow(fixture.kv, started.FlowID)
+	if err != nil {
+		t.Fatalf("reload flow: %v", err)
+	}
+	if stored.Status != codeBuddyLoginCompleted {
+		t.Fatalf("stored status = %q, want completed: a losing write overwrote the tokens", stored.Status)
+	}
+	if stored.AccessToken != "access-1" || stored.RefreshToken != "refresh-1" {
+		t.Fatalf("stored tokens = %q/%q, want the completed pair", stored.AccessToken, stored.RefreshToken)
+	}
+}
+
+// TestCodeBuddyLoginConcurrentPollsShareOneUpstreamCall is the end-to-end form of the same race:
+// two polls of one pending flow arrive together, and the upstream (which answers terminal on every
+// poll after the first) must be reached once. Both clients must see the completed payload.
+func TestCodeBuddyLoginConcurrentPollsShareOneUpstreamCall(t *testing.T) {
+	upstream := newFakeCodeBuddyUpstream(t, 0)
+	upstream.failAfterFirstSuccess = true
+	upstream.holdFirstToken = make(chan struct{})
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			close(upstream.holdFirstToken)
+		}
+	}
+	defer release()
+
+	fixture := newCodeBuddyLoginFixture(t, upstream.server.URL)
+	started := startCodeBuddyLoginOn(t, fixture, "codebuddy-cn")
+	pollPath := "/api/providers/codebuddy-cn/codebuddy-cn/login/" + started.FlowID
+
+	type result struct {
+		status int
+		body   string
+	}
+	results := make(chan result, 2)
+	poll := func() {
+		status, body := fixture.do(t, fasthttp.MethodGet, pollPath, "")
+		results <- result{status: status, body: body}
+	}
+
+	go poll()
+	// Wait until one poll is parked inside the upstream call, then start the second.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, tokenCalls, _ := upstream.counts(); tokenCalls >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the first poll never reached the upstream")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	go poll()
+	// Give the second poll time to arrive and block, then let the first finish.
+	time.Sleep(50 * time.Millisecond)
+	release()
+
+	for i := 0; i < 2; i++ {
+		select {
+		case got := <-results:
+			if got.status != fasthttp.StatusOK {
+				t.Fatalf("poll %d status = %d, want 200; body=%s", i+1, got.status, got.body)
+			}
+			decoded := decodeCodeBuddyLoginStatus(t, got.body)
+			if decoded.Status != "completed" || decoded.AccessToken != "access-1" || decoded.RefreshToken != "refresh-1" {
+				t.Fatalf("poll %d = %+v, want the completed token pair", i+1, decoded)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("a concurrent poll never answered")
+		}
+	}
+	if _, tokenCalls, _ := upstream.counts(); tokenCalls != 1 {
+		t.Fatalf("upstream token polled %d times, want 1: the second poll must read the settled flow", tokenCalls)
+	}
+	upstream.mu.Lock()
+	maxActive := upstream.maxActiveTokens
+	upstream.mu.Unlock()
+	if maxActive != 1 {
+		t.Fatalf("upstream saw %d token polls at once, want 1: one flow's state must not be presented twice", maxActive)
+	}
+}
+
+// failingKVStore wraps a real store and refuses writes, which is how a full or broken store
+// behaves from the handler's point of view.
+type failingKVStore struct {
+	schemas.KVStore
+	err error
+}
+
+func (s failingKVStore) SetWithTTL(string, any, time.Duration) error { return s.err }
+func (s failingKVStore) SetNXWithTTL(string, any, time.Duration) (bool, error) {
+	return false, s.err
+}
+
+// TestCodeBuddyLoginUnsavedResultIsNotHandedOut pins that a terminal answer the store refuses is
+// reported as an error rather than returned as success. Handing the tokens out anyway would leave
+// the client holding credentials the server still calls pending, and the next poll would re-dial a
+// state the upstream has already consumed.
+func TestCodeBuddyLoginUnsavedResultIsNotHandedOut(t *testing.T) {
+	upstream := newFakeCodeBuddyUpstream(t, 0)
+	fixture := newCodeBuddyLoginFixture(t, upstream.server.URL)
+	started := startCodeBuddyLoginOn(t, fixture, "codebuddy-cn")
+
+	completed := &codeBuddyLoginFlow{
+		Provider:     schemas.CodeBuddyCN,
+		Status:       codeBuddyLoginCompleted,
+		AccessToken:  "access-1",
+		RefreshToken: "refresh-1",
+		ExpiresAt:    time.Now().Add(codeBuddyLoginSettledTTL).UTC().Format(time.RFC3339),
+	}
+
+	// A store that reads the real flow but refuses every write is what a full or broken store looks
+	// like to the handler.
+	ctx := &fasthttp.RequestCtx{}
+	fixture.handler.finishCodeBuddyLogin(ctx, failingKVStore{KVStore: fixture.kv, err: errors.New("store is full")}, started.FlowID, completed)
+	if got := ctx.Response.StatusCode(); got != fasthttp.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body=%s", got, ctx.Response.Body())
+	}
+	if body := string(ctx.Response.Body()); strings.Contains(body, "access-1") || strings.Contains(body, "refresh-1") {
+		t.Fatalf("body %q handed out credentials the store never held", body)
+	}
+
+	// The flow really is still pending, so the client was told the truth: there is no stored
+	// outcome to contradict.
+	stored, err := loadCodeBuddyLoginFlow(fixture.kv, started.FlowID)
+	if err != nil {
+		t.Fatalf("reload flow: %v", err)
+	}
+	if stored.Status != codeBuddyLoginPending {
+		t.Fatalf("stored status = %q, want pending: a failed write must not settle the record", stored.Status)
+	}
+}
+
+// failingReadKVStore fails every read, standing in for a store that is down while a poll tries to
+// settle. The safer choice is to refuse the write: overwriting blind is how a token pair dies.
+type failingReadKVStore struct {
+	schemas.KVStore
+}
+
+func (failingReadKVStore) Get(string) (any, error) { return nil, errors.New("store is down") }
+
+func TestCodeBuddyLoginUnreadableStoreIsNotOverwritten(t *testing.T) {
+	upstream := newFakeCodeBuddyUpstream(t, 0)
+	fixture := newCodeBuddyLoginFixture(t, upstream.server.URL)
+	started := startCodeBuddyLoginOn(t, fixture, "codebuddy-cn")
+
+	ctx := &fasthttp.RequestCtx{}
+	fixture.handler.finishCodeBuddyLogin(ctx, failingReadKVStore{KVStore: fixture.kv}, started.FlowID,
+		failedCodeBuddyLogin(&codeBuddyLoginFlow{Provider: schemas.CodeBuddyCN}, "codebuddy login was refused by the provider (code 40901)"))
+	if got := ctx.Response.StatusCode(); got != fasthttp.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body=%s", got, ctx.Response.Body())
+	}
+	stored, err := loadCodeBuddyLoginFlow(fixture.kv, started.FlowID)
+	if err != nil {
+		t.Fatalf("reload flow: %v", err)
+	}
+	if stored.Status != codeBuddyLoginPending {
+		t.Fatalf("stored status = %q, want pending: an unreadable store must not be written blind", stored.Status)
+	}
+}
+
+// TestCodeBuddyLoginUnknownProviderBeatsMissingStore pins the ordering at start: a provider the
+// gateway does not know is a 404 even on a deployment whose store failed to initialise, rather than
+// a 500 blaming the store for a request that was never going to work.
+func TestCodeBuddyLoginUnknownProviderBeatsMissingStore(t *testing.T) {
+	SetLogger(&mockLogger{})
+	handler := &ProviderHandler{inMemoryStore: &lib.Config{}}
+
+	var ctx fasthttp.RequestCtx
+	ctx.Request.Header.SetMethod(fasthttp.MethodPost)
+	ctx.Request.SetRequestURI("/api/providers/no-such-provider/codebuddy-cn/login")
+	ctx.SetUserValue("provider", "no-such-provider")
+
+	handler.startCodeBuddyLogin(&ctx)
+
+	if got := ctx.Response.StatusCode(); got != fasthttp.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", got, ctx.Response.Body())
+	}
+	if body := string(ctx.Response.Body()); strings.Contains(body, "kv store") {
+		t.Fatalf("body %q blamed the store for an unknown provider", body)
+	}
+}
+
+// TestCodeBuddyLoginPollRejectsUnknownProviderBeforeStore pins the same ordering on the poll route.
+func TestCodeBuddyLoginPollRejectsUnknownProviderBeforeStore(t *testing.T) {
+	SetLogger(&mockLogger{})
+	handler := &ProviderHandler{inMemoryStore: &lib.Config{}}
+
+	var ctx fasthttp.RequestCtx
+	ctx.Request.Header.SetMethod(fasthttp.MethodGet)
+	ctx.Request.SetRequestURI("/api/providers/no-such-provider/codebuddy-cn/login/flow-1")
+	ctx.SetUserValue("provider", "no-such-provider")
+	ctx.SetUserValue("flow_id", "flow-1")
+
+	handler.pollCodeBuddyLogin(&ctx)
+
+	if got := ctx.Response.StatusCode(); got != fasthttp.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", got, ctx.Response.Body())
+	}
+	if body := string(ctx.Response.Body()); strings.Contains(body, "kv store") {
+		t.Fatalf("body %q blamed the store for an unknown provider", body)
+	}
+}
+
+// TestCodeBuddyLoginURLErrorDropsTheState pins that a malformed configured base_url cannot leak the
+// upstream state through the *url.Error NewRequestWithContext wraps around its failure.
+func TestCodeBuddyLoginURLErrorDropsTheState(t *testing.T) {
+	SetLogger(&mockLogger{})
+	handler := &ProviderHandler{inMemoryStore: &lib.Config{}}
+	var ctx fasthttp.RequestCtx
+
+	// An unparseable URL makes NewRequestWithContext fail before any dial.
+	_, err := handler.codeBuddyLoginCall(&ctx, http.MethodGet, "https://exa mple.test/v2/plugin/auth/token?state=s1")
+	if err == nil {
+		t.Fatal("expected the malformed URL to be refused")
+	}
+	if strings.Contains(err.Error(), "state=s1") {
+		t.Fatalf("error %q carried the upstream state", err.Error())
 	}
 }
 
