@@ -805,9 +805,10 @@ func (h *ProviderHandler) mergeUpdatedKey(oldRawKey, updateKey schemas.Key) (sch
 		// runtime, so the value captured at read time is already stale by the time this merge
 		// runs — a refresh may have landed in between, and resolving the mask against the stale
 		// capture would write back the predecessor refresh token that upstream has invalidated.
-		// The mask is carried through and resolved under the write lock instead, against whatever
-		// is stored then (see Config.preserveRotatedOAuthTokens). This still rejects a mask with no
-		// stored counterpart, so a preview can never reach persistence.
+		// They are carried through untouched and the write path rebuilds the row from the currently
+		// stored key, so whatever shape reaches it — mask, stale literal, or omitted section — the
+		// stored tokens win (see Config.operatorKeyRow). This still rejects a mask with no stored
+		// counterpart, so a preview can never reach persistence.
 		for _, item := range []struct {
 			incoming *schemas.SecretVar
 			stored   *schemas.SecretVar

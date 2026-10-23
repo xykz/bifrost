@@ -8792,7 +8792,7 @@ const TokenPersistTimeout = 10 * time.Second
 // The returned error reports an in-memory apply failure only (unknown provider or key). Store
 // failures are logged from the background write, since the caller has already moved on.
 func (c *Config) UpdateProviderKeyTokens(ctx context.Context, provider schemas.ModelProvider, keyID, accessToken, refreshToken, expiresAt string) error {
-	updatedKey, changed, err := c.applyProviderKeyTokens(provider, keyID, accessToken, refreshToken, expiresAt)
+	_, changed, err := c.applyProviderKeyTokens(provider, keyID, accessToken, refreshToken, expiresAt)
 	if err != nil || !changed {
 		return err
 	}
@@ -8800,7 +8800,7 @@ func (c *Config) UpdateProviderKeyTokens(ctx context.Context, provider schemas.M
 		// The store is captured here rather than read inside the goroutine: a config reload can
 		// replace or clear it, and a nil dereference on a background goroutine would take the
 		// process down.
-		c.persistProviderKeyTokens(store, provider, keyID, updatedKey)
+		c.persistProviderKeyTokens(store, provider, keyID)
 	}
 	return nil
 }
@@ -8860,19 +8860,48 @@ func (c *Config) applyProviderKeyTokens(provider schemas.ModelProvider, keyID, a
 	return updatedKey, true, nil
 }
 
-// persistProviderKeyTokens writes the rotation to the config store on a bounded, detached
-// goroutine. It is started only for a rotation that actually changed the key, so the goroutine
-// count is bounded by the number of keys times the refresh rate the token lifetime allows.
+// persistProviderKeyTokens makes the stored row match the in-memory key. It is started only for a
+// rotation that actually changed the key, so the goroutine count is bounded by the number of keys
+// times the refresh rate the token lifetime allows.
+//
+// What it writes is not a snapshot taken when the rotation was applied — it is the key as it stands
+// when the store is reached, read under c.Mu. That distinction is the whole point: c.Mu is also the
+// lock the operator key-edit path holds across its own store write, so a rename that lands while
+// this write is queued is already in memory and therefore already in the row this writes. A
+// captured-at-apply snapshot would instead overwrite the rename with the pre-edit name, leaving
+// memory and store disagreeing until the next restart resurrected the old row.
+//
+// Holding c.Mu across the store call is deliberate: it is what makes "the row matches memory"
+// true after every write, because every key-row writer serializes on the same lock and each writes
+// a row built from the state the previous one left behind. The request that triggered the rotation
+// never waits for it — it was served from the in-memory apply — so the exposure is a slow store
+// holding the lock for up to TokenPersistTimeout, once per rotation rather than once per request.
 //
 // The write runs detached from the request that discovered the rotation: tokencache runs the mint
 // on a context that already survives client disconnects, and a rotation must land even if the
 // client that happened to trigger it hangs up.
-func (c *Config) persistProviderKeyTokens(store configstore.ConfigStore, provider schemas.ModelProvider, keyID string, key schemas.Key) {
+func (c *Config) persistProviderKeyTokens(store configstore.ConfigStore, provider schemas.ModelProvider, keyID string) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), TokenPersistTimeout)
 		defer cancel()
 
-		if err := store.UpdateProviderKey(ctx, provider, keyID, key); err != nil {
+		c.Mu.Lock()
+		defer c.Mu.Unlock()
+
+		existingConfig, exists := c.Providers[provider]
+		if !exists {
+			return
+		}
+		index := slices.IndexFunc(existingConfig.Keys, func(existingKey schemas.Key) bool {
+			return existingKey.ID == keyID
+		})
+		if index == -1 {
+			// The key was removed while this write was queued. Writing it anyway would resurrect a
+			// deleted row.
+			return
+		}
+
+		if err := store.UpdateProviderKey(ctx, provider, keyID, existingConfig.Keys[index]); err != nil {
 			// Logged, not returned: the caller was told the rotation succeeded (it did, in memory),
 			// and the only consequence is that a restart needs a re-login for this key.
 			logger.Error("failed to persist rotated provider key tokens for key %s of provider %s: %v", keyID, provider, err)
@@ -8880,49 +8909,18 @@ func (c *Config) persistProviderKeyTokens(store configstore.ConfigStore, provide
 		}
 		// The store may rewrite secrets into environment or vault references on its own row copy.
 		// Re-read so the in-memory key carries the references rather than the plaintext, matching
-		// what AddProviderKey and UpdateProviderKey do. A failure here leaves the plaintext in
-		// memory, which still authenticates; the row is already written.
+		// what AddProviderKey and UpdateProviderKey do. Safe to adopt wholesale: no other key writer
+		// can run while c.Mu is held here.
 		storedKey, err := store.GetProviderKey(ctx, provider, keyID)
 		if err != nil {
 			logger.Error("failed to re-read stored key %s for provider %s after token update: %v", keyID, provider, err)
 			return
 		}
-		c.replaceProviderKeyOAuthTokens(provider, keyID, storedKey)
+		updatedConfig := existingConfig
+		updatedConfig.Keys = append([]schemas.Key(nil), existingConfig.Keys...)
+		updatedConfig.Keys[index] = *storedKey
+		c.Providers[provider] = updatedConfig
 	}()
-}
-
-// replaceProviderKeyOAuthTokens adopts the store's copy of the OAuth block if the in-memory key
-// still holds the tokens this write stored. Comparing first matters: a newer rotation may have
-// applied while the write was in flight, and the older store copy must not overwrite the newer
-// token in memory.
-func (c *Config) replaceProviderKeyOAuthTokens(provider schemas.ModelProvider, keyID string, storedKey *schemas.Key) {
-	if storedKey == nil || storedKey.OAuthKeyConfig == nil {
-		return
-	}
-	c.Mu.Lock()
-	defer c.Mu.Unlock()
-
-	existingConfig, exists := c.Providers[provider]
-	if !exists {
-		return
-	}
-	index := slices.IndexFunc(existingConfig.Keys, func(existingKey schemas.Key) bool {
-		return existingKey.ID == keyID
-	})
-	if index == -1 {
-		return
-	}
-	current := existingConfig.Keys[index].OAuthKeyConfig
-	if current == nil || current.RefreshToken.GetValue() != storedKey.OAuthKeyConfig.RefreshToken.GetValue() {
-		return
-	}
-
-	updatedConfig := existingConfig
-	updatedConfig.Keys = append([]schemas.Key(nil), existingConfig.Keys...)
-	updatedKey := existingConfig.Keys[index]
-	updatedKey.OAuthKeyConfig = storedKey.OAuthKeyConfig
-	updatedConfig.Keys[index] = updatedKey
-	c.Providers[provider] = updatedConfig
 }
 
 // skipDBUpdate reports whether the context asks configuration writes to leave the store alone.
@@ -8942,32 +8940,70 @@ func skipDBUpdate(ctx context.Context) bool {
 	return false
 }
 
-// preserveRotatedOAuthTokens resolves browser_login's two rotating credential fields against the
-// key stored right now, under the write lock, rather than against the copy the handler read before
-// it merged. They rotate at runtime: a refresh can land between the handler's read and this write,
-// and a save that echoes the mask it was shown would otherwise restore the precursor refresh token,
-// which upstream has already invalidated — leaving the key dead until a re-login.
+// operatorKeyRow builds the row an operator save persists. It starts from the key that is stored
+// right now and copies over only the fields the key-edit API owns, so a save can never carry a
+// stale copy of anything else.
 //
-// The mask itself is the signal. The handler refuses a mask that had no stored counterpart at read
-// time, so a mask reaching here means "unchanged" and the current stored value is the right answer.
-// A mask with nothing stored now (the block was cleared in between) is left as-is; the next refresh
-// will mint and its sink will fill the fields back in.
+// The three rotating credential fields are the reason this exists. access_token, refresh_token and
+// expires_at are minted by the login flow and rewritten by every rotation; they are not
+// configuration. Two writers touching one row as whole-key snapshots meant the later write silently
+// reverted the other: a rename/weight-only save carried the tokens the handler read before the
+// rotation, and persisting those restored the refresh token upstream had already invalidated.
+// Giving the token fields exactly one writer (the rotation sink) closes that structurally, whatever
+// shape the request body takes — omitted section, redacted mask, or a stale literal.
 //
-// Taking the stored value under the lock covers both orderings: if the rotation committed before
-// this write, the stored value is the new token; if it commits after, it overwrites this write.
-func preserveRotatedOAuthTokens(incoming schemas.Key, stored schemas.Key) schemas.Key {
-	if incoming.OAuthKeyConfig == nil || stored.OAuthKeyConfig == nil {
-		return incoming
+// Consequence, deliberate: an operator cannot set or clear these three fields through the key-edit
+// API. Sending them is accepted and ignored, and the stored values are preserved. That is correct,
+// because a hand-written access token would simply be overwritten by the next rotation, and a
+// hand-written refresh token is never valid upstream.
+func operatorKeyRow(incoming, stored schemas.Key) schemas.Key {
+	row := stored
+	row.Name = incoming.Name
+	row.Value = incoming.Value
+	row.Models = incoming.Models
+	row.BlacklistedModels = incoming.BlacklistedModels
+	row.Weight = incoming.Weight
+	row.Aliases = incoming.Aliases
+	row.AzureKeyConfig = incoming.AzureKeyConfig
+	row.VertexKeyConfig = incoming.VertexKeyConfig
+	row.BedrockKeyConfig = incoming.BedrockKeyConfig
+	row.BedrockMantleKeyConfig = incoming.BedrockMantleKeyConfig
+	row.VLLMKeyConfig = incoming.VLLMKeyConfig
+	row.ReplicateKeyConfig = incoming.ReplicateKeyConfig
+	row.OllamaKeyConfig = incoming.OllamaKeyConfig
+	row.SGLKeyConfig = incoming.SGLKeyConfig
+	row.DatabricksKeyConfig = incoming.DatabricksKeyConfig
+	row.GithubCopilotKeyConfig = incoming.GithubCopilotKeyConfig
+	row.CloudflareKeyConfig = incoming.CloudflareKeyConfig
+	row.OAuthKeyConfig = operatorOAuthKeyConfig(incoming.OAuthKeyConfig, stored.OAuthKeyConfig)
+	row.Enabled = incoming.Enabled
+	row.UseForBatchAPI = incoming.UseForBatchAPI
+	row.UseAnthropicEndpoints = incoming.UseAnthropicEndpoints
+	row.UseOpenAIEndpoints = incoming.UseOpenAIEndpoints
+	row.Description = incoming.Description
+	// ID, Status and ConfigHash come from `stored`: none of them is editable through the API, and
+	// Status is owned by health tracking.
+	return row
+}
+
+// operatorOAuthKeyConfig applies an operator's edits to the OAuth block while keeping the rotating
+// tokens exactly as stored. A nil incoming block is an explicit clear and is honoured; there are no
+// stored tokens to preserve in that case.
+func operatorOAuthKeyConfig(incoming, stored *schemas.OAuthKeyConfig) *schemas.OAuthKeyConfig {
+	if incoming == nil {
+		return nil
 	}
-	cfg := *incoming.OAuthKeyConfig
-	if cfg.AccessToken.IsMaskedPlaceholder() && stored.OAuthKeyConfig.AccessToken.IsSet() {
-		cfg.AccessToken = stored.OAuthKeyConfig.AccessToken
+	cfg := *incoming
+	if stored == nil {
+		cfg.AccessToken = nil
+		cfg.RefreshToken = nil
+		cfg.ExpiresAt = ""
+		return &cfg
 	}
-	if cfg.RefreshToken.IsMaskedPlaceholder() && stored.OAuthKeyConfig.RefreshToken.IsSet() {
-		cfg.RefreshToken = stored.OAuthKeyConfig.RefreshToken
-	}
-	incoming.OAuthKeyConfig = &cfg
-	return incoming
+	cfg.AccessToken = stored.AccessToken
+	cfg.RefreshToken = stored.RefreshToken
+	cfg.ExpiresAt = stored.ExpiresAt
+	return &cfg
 }
 
 // UpdateProviderKey updates a single key on an existing provider configuration.
@@ -8989,7 +9025,7 @@ func (c *Config) UpdateProviderKey(ctx context.Context, provider schemas.ModelPr
 
 	updatedConfig := existingConfig
 	updatedConfig.Keys = append([]schemas.Key(nil), existingConfig.Keys...)
-	key = preserveRotatedOAuthTokens(key, existingConfig.Keys[index])
+	key = operatorKeyRow(key, existingConfig.Keys[index])
 	key.ID = keyID
 	updatedConfig.Keys[index] = key
 
