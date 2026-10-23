@@ -39,9 +39,10 @@ func TestCodebuddycn(t *testing.T) {
 	// ListModels is enabled because model listing is one of the four operations the provider
 	// implements: it answers with the pinned catalog when the gateway serves none. ToolCalls
 	// stays on because the request path is the shared OpenAI converter, which already carries
-	// function schemas. The streaming and multi-call variants are off: they are not part of what
-	// this task can verify here, and a flag left on without a credential to run it is a claim,
-	// not a test.
+	// function schemas — and enabling ToolCalls also exercises the streaming tool-call paths,
+	// since those suites gate on ToolCalls rather than on ToolCallsStreaming. The remaining
+	// variants are off: they are not part of what this task can verify here, and a flag left on
+	// without a credential to run it is a claim, not a test.
 	testConfig := llmtests.ComprehensiveTestConfig{
 		Provider:       schemas.CodeBuddyCN,
 		ChatModel:      "hunyuan-chat",

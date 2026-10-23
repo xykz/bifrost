@@ -1013,14 +1013,15 @@ func (account *ComprehensiveTestAccount) GetConfigForProvider(providerKey schema
 			},
 		}, nil
 	case schemas.CodeBuddyCN:
-		// Tencent's gateway fronts the inference routes with an APISIX edge that can answer 5xx
-		// while it is rebalancing, so the suite retries like its other OpenAI-compatible peers.
+		// Same retry shape as Groq: this provider collapses every non-401 upstream failure to a
+		// transient 502, so a genuinely failing scenario would otherwise spend the whole suite
+		// timeout retrying. A short cap keeps a real failure visible quickly.
 		return &schemas.ProviderConfig{
 			NetworkConfig: schemas.NetworkConfig{
 				DefaultRequestTimeoutInSeconds: 120,
 				MaxRetries:                     10,
-				RetryBackoffInitial:            5 * time.Second,
-				RetryBackoffMax:                3 * time.Minute,
+				RetryBackoffInitial:            1 * time.Second,
+				RetryBackoffMax:                15 * time.Second,
 			},
 			ConcurrencyAndBufferSize: schemas.ConcurrencyAndBufferSize{
 				Concurrency: Concurrency,
