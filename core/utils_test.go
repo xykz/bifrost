@@ -646,7 +646,10 @@ func TestValidateKeyOAuthKeyConfig(t *testing.T) {
 		key := schemas.Key{OAuthKeyConfig: cc(nil)}
 		err := validateKey(schemas.Anthropic, &key)
 		require.Error(t, err)
+		// The message has to name every provider that honours the block, not only openai: an
+		// operator reading it should not conclude codebuddy-cn would ignore it.
 		assert.Contains(t, err.Error(), "only supported on openai")
+		assert.Contains(t, err.Error(), "codebuddy-cn")
 	})
 }
 

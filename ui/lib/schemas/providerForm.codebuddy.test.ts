@@ -94,6 +94,21 @@ describe("ProviderFormSchema codebuddy-cn credentials", () => {
 		expect(parse({ value: "", oauth_key_config: oauth({ expires_at: "22/10/2026 12:00" }) }).success).toBe(false);
 	});
 
+	// Go's time.Parse rejects "+25:00" with "time zone offset hour out of range", so a form that
+	// accepted it would pass validation and then 400 on save. Go does accept +24:00, but the RFC
+	// bounds an offset to 23:59, so the form holds to the standard rather than to one parser quirk.
+	it("bounds the zone offset to 23:59", () => {
+		expect(parse({ value: "", oauth_key_config: oauth({ expires_at: "2026-10-22T12:00:00+05:30" }) }).success).toBe(true);
+		expect(parse({ value: "", oauth_key_config: oauth({ expires_at: "2026-10-22T12:00:00-08:00" }) }).success).toBe(true);
+		expect(parse({ value: "", oauth_key_config: oauth({ expires_at: "2026-10-22T12:00:00+23:59" }) }).success).toBe(true);
+		expect(parse({ value: "", oauth_key_config: oauth({ expires_at: "2026-10-22T12:00:00Z" }) }).success).toBe(true);
+
+		expect(parse({ value: "", oauth_key_config: oauth({ expires_at: "2026-10-22T12:00:00+25:00" }) }).success).toBe(false);
+		expect(parse({ value: "", oauth_key_config: oauth({ expires_at: "2026-10-22T12:00:00+99:00" }) }).success).toBe(false);
+		expect(parse({ value: "", oauth_key_config: oauth({ expires_at: "2026-10-22T12:00:00+05:60" }) }).success).toBe(false);
+		expect(parse({ value: "", oauth_key_config: oauth({ expires_at: "2026-10-22T12:00:00+24:00" }) }).success).toBe(false);
+	});
+
 	// The shared oauth_key_config field is provider-agnostic; the codebuddy-cn branch must not
 	// narrow it for everyone else.
 	it("leaves another provider's client credentials key valid", () => {

@@ -1833,7 +1833,9 @@ func loadProviders(ctx context.Context, config *Config, configData *ConfigData) 
 		for providerName, providerCfgInFile := range configData.Providers {
 			provider := schemas.ModelProvider(strings.ToLower(providerName))
 			existingCfg, exists := providersInConfigStore[provider]
-			processAuthoritativeProvider(providerName, providerCfgInFile, existingCfg, exists, authoritativeProviders)
+			if err := processAuthoritativeProvider(providerName, providerCfgInFile, existingCfg, exists, authoritativeProviders); err != nil {
+				return err
+			}
 		}
 		providersInConfigStore = authoritativeProviders
 	} else {
@@ -1926,6 +1928,9 @@ func processProvider(
 		if err := providerKeyInFile.Aliases.Validate(baseProvider); err != nil {
 			return fmt.Errorf("invalid aliases for key %q in provider %s: %w", providerKeyInFile.Name, provider, err)
 		}
+		if err := validateKeyAuthMode(baseProvider, providerKeyInFile); err != nil {
+			return fmt.Errorf("invalid key %q in provider %s: %w", providerKeyInFile.Name, provider, err)
+		}
 	}
 	// Generate hash from config.json provider config
 	fileProviderConfigHash, err := providerCfgInFile.GenerateConfigHash(string(provider))
@@ -1938,14 +1943,42 @@ func processProvider(
 	return nil
 }
 
+// validateKeyAuthMode enforces the auth-mode rules a provider's key shape has that the generic
+// per-key checks cannot express. It mirrors the same rule in the management API
+// (handlers.validateProviderKeyURL) and in config.schema.json's codebuddy_cn_key, so a hand-edited
+// config.json, an API save, and an IDE-validated file all agree.
+func validateKeyAuthMode(provider schemas.ModelProvider, key schemas.Key) error {
+	if provider != schemas.CodeBuddyCN {
+		return nil
+	}
+	// A reference counts as present even when its target is unset in this environment: the value
+	// is resolved elsewhere, and an unmarshal leaves Val empty in that case. Checking Val alone
+	// would reject every env-backed key, which is the documented config.json shape.
+	hasValue := key.Value.IsFromSecret() || strings.TrimSpace(key.Value.GetValue()) != ""
+	hasOAuth := key.OAuthKeyConfig != nil
+	switch {
+	case hasValue && hasOAuth:
+		// resolveKey prefers the pasted value, so the configured login would be silently unused.
+		return fmt.Errorf("a codebuddy-cn key takes either a pasted api key or an oauth login, not both")
+	case !hasValue && !hasOAuth:
+		return fmt.Errorf("a codebuddy-cn key requires either value or oauth_key_config with grant_type browser_login")
+	case hasOAuth && key.OAuthKeyConfig.GrantType != schemas.OAuthGrantBrowserLogin:
+		return fmt.Errorf("a codebuddy-cn key's oauth_key_config must use grant_type browser_login")
+	}
+	return nil
+}
+
 // processAuthoritativeProvider adds one config.json provider to the authoritative provider set.
+// It returns an error for a key the provider's own shape refuses: unlike the merge path, which can
+// skip a provider and let the store supply the rest, this path writes the file through, so an
+// unusable key would become the stored row and only surface as an unauthenticated request.
 func processAuthoritativeProvider(
 	providerName string,
 	providerCfgInFile configstore.ProviderConfig,
 	existingCfg configstore.ProviderConfig,
 	exists bool,
 	providers map[schemas.ModelProvider]configstore.ProviderConfig,
-) {
+) error {
 	provider := schemas.ModelProvider(strings.ToLower(providerName))
 	if err := ValidateCustomProvider(providerCfgInFile, provider); err != nil {
 		logger.Warn("invalid custom provider config for %s (writing through): %v", provider, err)
@@ -1957,6 +1990,9 @@ func processAuthoritativeProvider(
 	for i, providerKeyInFile := range providerCfgInFile.Keys {
 		if providerKeyInFile.ID == "" {
 			providerCfgInFile.Keys[i].ID = uuid.NewString()
+		}
+		if err := validateKeyAuthMode(baseProvider, providerKeyInFile); err != nil {
+			return fmt.Errorf("invalid key %q in provider %s: %w", providerKeyInFile.Name, provider, err)
 		}
 		if err := providerKeyInFile.Aliases.Validate(baseProvider); err != nil {
 			logger.Warn("invalid aliases for key %q in provider %s (writing through): %v", providerKeyInFile.Name, provider, err)
@@ -1973,6 +2009,7 @@ func processAuthoritativeProvider(
 		providerCfgInFile.Description = existingCfg.Description
 	}
 	providers[provider] = providerCfgInFile
+	return nil
 }
 
 // mergeProviderWithHash merges provider config using hash-based reconciliation
@@ -8998,8 +9035,9 @@ func operatorKeyRow(incoming, stored schemas.Key, readTokens *schemas.OAuthKeyCo
 // First, each token field is resolved on its own. A masked placeholder is a redaction of something
 // the client was shown, never a credential; an absent field carries no new credential either. Both
 // mean "keep what is stored", when there is something stored. Any other value is a literal the
-// client is supplying. The expiry follows the tokens: if either one had to come from storage, the
-// stored expiry is the consistent choice, and only a pair of genuinely new literals brings its own.
+// client is supplying. The expiry follows the access token, because that is the credential it
+// describes: a stored access token keeps the stored deadline, and a new one keeps whatever the
+// request said — including an empty value, which means "refresh on use".
 //
 // Second, the resolved pair is compared with what the request read. A field is unchanged when it
 // came from storage or when its literal equals the read-time value — including both being absent,
@@ -9035,10 +9073,18 @@ func operatorOAuthKeyConfig(incoming, stored, readTokens *schemas.OAuthKeyConfig
 
 	cfg.AccessToken = access
 	cfg.RefreshToken = refresh
-	if stored != nil {
-		if accessFromStored || refreshFromStored {
-			cfg.ExpiresAt = stored.ExpiresAt
-		}
+	// The expiry describes the access token and must follow its provenance, not the pair's. A save
+	// that supplies a new refresh token alongside a stored access token is the documented
+	// re-authentication shape (the client sends only refresh_token); taking the incoming expiry
+	// there would pair a credential from storage with a deadline that was never about it, and
+	// taking the stored one when the access token is new is worse — resolveKey's stored-token fast
+	// path would refuse the fresh token as already expired and mint on every request until the
+	// next rotation. So the access token's own side decides: a stored access token keeps the stored
+	// deadline, and an incoming one keeps the incoming expiry verbatim, including an empty value
+	// ("refresh on use"). No expiry is invented either way. accessFromStored is only true when a
+	// stored token was actually resolved, so the stored deadline is present here.
+	if accessFromStored {
+		cfg.ExpiresAt = stored.ExpiresAt
 	}
 
 	if readTokens == nil {

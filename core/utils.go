@@ -233,7 +233,7 @@ func validateKey(providerKey schemas.ModelProvider, key *schemas.Key) error {
 	// still refuses to save one.
 	if key.OAuthKeyConfig != nil {
 		if !ProviderSupportsOAuthKeyConfig(providerKey) {
-			return fmt.Errorf("oauth_key_config is only supported on openai and on custom providers whose base_provider_type is openai")
+			return fmt.Errorf("oauth_key_config is only supported on openai, on codebuddy-cn, and on custom providers whose base_provider_type is openai")
 		}
 		if strings.TrimSpace(key.Value.GetValue()) == "" {
 			if err := key.OAuthKeyConfig.Validate(); err != nil {

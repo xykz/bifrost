@@ -2311,6 +2311,53 @@ func TestUpdateProviderKeyTokensIdempotentAndAccessOnly(t *testing.T) {
 	})
 }
 
+// TestInstallCodeBuddyCredentialSinkUninstalls pins the lifecycle: the install returns a func that
+// clears the sink, it is idempotent, and a replacement is allowed but logged. Without the uninstall
+// two servers in one process share whichever sink booted last, and a test that installs leaks one
+// into the next case.
+func TestInstallCodeBuddyCredentialSinkUninstalls(t *testing.T) {
+	SetLogger(&mockLogger{})
+	lib.SetLogger(&mockLogger{})
+	t.Cleanup(func() { codebuddycn.SetCredentialSink(nil) })
+
+	config := &lib.Config{Providers: map[schemas.ModelProvider]configstore.ProviderConfig{}}
+
+	uninstall := InstallCodeBuddyCredentialSink(config)
+	if !codebuddycn.HasCredentialSink() {
+		t.Fatal("the install must leave a sink installed")
+	}
+
+	uninstall()
+	if codebuddycn.HasCredentialSink() {
+		t.Fatal("the uninstall must clear the sink")
+	}
+
+	// Idempotent: a double cleanup must not clear a sink some later server installed.
+	second := InstallCodeBuddyCredentialSink(config)
+	uninstall()
+	if !codebuddycn.HasCredentialSink() {
+		t.Fatal("a second call to an old uninstall must not clear the current sink")
+	}
+	second()
+	if codebuddycn.HasCredentialSink() {
+		t.Fatal("the second install's own uninstall must clear it")
+	}
+}
+
+// A nil config must not install anything: there is no store to write to, and a sink that silently
+// does nothing is worse than none.
+func TestInstallCodeBuddyCredentialSinkWithNoConfigInstallsNothing(t *testing.T) {
+	SetLogger(&mockLogger{})
+	codebuddycn.SetCredentialSink(nil)
+	t.Cleanup(func() { codebuddycn.SetCredentialSink(nil) })
+
+	uninstall := InstallCodeBuddyCredentialSink(nil)
+	if codebuddycn.HasCredentialSink() {
+		t.Fatal("no config means no sink")
+	}
+	uninstall()
+}
+
 // TestInstallCodeBuddyCredentialSinkPersistsARotation pins the wiring end to end: a real provider
 // refresh invokes the sink this function installs, and the rotation lands in the config store.
 // Driving persistRotatedCredential directly would leave the installation itself untested.
@@ -2339,7 +2386,8 @@ func TestInstallCodeBuddyCredentialSinkPersistsARotation(t *testing.T) {
 			schemas.CodeBuddyCN: {Keys: []schemas.Key{{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: browserLoginConfig()}}},
 		},
 	}
-	InstallCodeBuddyCredentialSink(config)
+	uninstall := InstallCodeBuddyCredentialSink(config)
+	t.Cleanup(uninstall)
 
 	provider, err := codebuddycn.NewCodeBuddyCNProvider(&schemas.ProviderConfig{
 		NetworkConfig: schemas.NetworkConfig{
@@ -2808,14 +2856,101 @@ func TestMaskedAccessTokenWithANewRefreshTokenResolvesTheMask(t *testing.T) {
 	if inMemory.RefreshToken.GetValue() != "refresh-new" {
 		t.Fatalf("refresh token = %q, want the new literal", inMemory.RefreshToken.GetValue())
 	}
-	// One field came from storage, so the stored expiry is the consistent choice.
+	// The expiry follows the *access token*, which came from storage, so the stored deadline is the
+	// one that describes it. The new refresh token is irrelevant here: it mints the replacement
+	// token later, and that mint's own expiry is written by the rotation sink.
 	if inMemory.ExpiresAt != "2026-10-22T12:00:00Z" {
-		t.Fatalf("expiry = %q, want the stored expiry", inMemory.ExpiresAt)
+		t.Fatalf("expiry = %q, want the stored expiry that belongs to the stored access token", inMemory.ExpiresAt)
 	}
 
 	store.awaitWrites(t, 1)
 	if got := store.storedKey(t, "key-1").OAuthKeyConfig; got.AccessToken.IsMaskedPlaceholder() || got.AccessToken.GetValue() != "access-stored" {
 		t.Fatalf("store access token = %q, want the stored credential", got.AccessToken.GetValue())
+	}
+}
+
+// TestNewAccessTokenIsNotPairedWithTheStoredExpiry is Important 1's reproduction. A save that
+// supplies a genuinely new access token — a fresh login, or a client that re-authenticates with the
+// whole pair — must carry that token's own deadline. The old rule took the stored expiry whenever
+// *either* rotating field came from storage, so a new access token saved next to a masked/absent
+// refresh token inherited the dead credential's deadline. resolveKey's stored-token fast path then
+// read the fresh token as already expired and minted on every request until the next rotation.
+func TestNewAccessTokenIsNotPairedWithTheStoredExpiry(t *testing.T) {
+	SetLogger(&mockLogger{})
+	lib.SetLogger(&mockLogger{})
+
+	store := newTokenWriteStore(schemas.Key{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: browserLoginConfig()})
+	config := &lib.Config{
+		ConfigStore: store,
+		Providers: map[schemas.ModelProvider]configstore.ProviderConfig{
+			schemas.CodeBuddyCN: {Keys: []schemas.Key{{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: browserLoginConfig()}}},
+		},
+	}
+	attachBifrostClient(t, config)
+
+	readTime, err := config.GetProviderKeyRaw(schemas.CodeBuddyCN, "key-1")
+	if err != nil {
+		t.Fatalf("GetProviderKeyRaw: %v", err)
+	}
+
+	// A new access token with the refresh token echoed as a mask: the access token is incoming, the
+	// refresh token resolves from storage.
+	mixed := *readTime.OAuthKeyConfig
+	mixed.AccessToken = schemas.NewSecretVar("access-login")
+	mixed.RefreshToken = readTime.OAuthKeyConfig.RefreshToken.Redacted()
+	mixed.ExpiresAt = "2026-10-22T15:00:00Z"
+	if err := config.UpdateProviderKeyWithReadTokens(context.Background(), schemas.CodeBuddyCN, "key-1", schemas.Key{
+		ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: &mixed,
+	}, readTime.OAuthKeyConfig); err != nil {
+		t.Fatalf("UpdateProviderKeyWithReadTokens: %v", err)
+	}
+
+	inMemory := storedProviderKey(t, config, "key-1").OAuthKeyConfig
+	if inMemory.AccessToken.GetValue() != "access-login" {
+		t.Fatalf("access token = %q, want the new literal", inMemory.AccessToken.GetValue())
+	}
+	if inMemory.ExpiresAt != "2026-10-22T15:00:00Z" {
+		t.Fatalf("expiry = %q, want the new access token's own expiry, not the stored one", inMemory.ExpiresAt)
+	}
+}
+
+// TestNewTokenPairWithOmittedExpiryDoesNotEmptyTheExpiry is the second half of Important 1: a
+// brand-new pair with no expires_at must store no expiry at all (the documented "refresh on use"),
+// rather than inheriting the deadline of the credential it replaced.
+func TestNewTokenPairWithOmittedExpiryDoesNotEmptyTheExpiry(t *testing.T) {
+	SetLogger(&mockLogger{})
+	lib.SetLogger(&mockLogger{})
+
+	store := newTokenWriteStore(schemas.Key{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: browserLoginConfig()})
+	config := &lib.Config{
+		ConfigStore: store,
+		Providers: map[schemas.ModelProvider]configstore.ProviderConfig{
+			schemas.CodeBuddyCN: {Keys: []schemas.Key{{ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: browserLoginConfig()}}},
+		},
+	}
+	attachBifrostClient(t, config)
+
+	readTime, err := config.GetProviderKeyRaw(schemas.CodeBuddyCN, "key-1")
+	if err != nil {
+		t.Fatalf("GetProviderKeyRaw: %v", err)
+	}
+
+	fresh := *readTime.OAuthKeyConfig
+	fresh.AccessToken = schemas.NewSecretVar("access-login")
+	fresh.RefreshToken = schemas.NewSecretVar("refresh-login")
+	fresh.ExpiresAt = ""
+	if err := config.UpdateProviderKeyWithReadTokens(context.Background(), schemas.CodeBuddyCN, "key-1", schemas.Key{
+		ID: "key-1", Name: "cb", Weight: 1, OAuthKeyConfig: &fresh,
+	}, readTime.OAuthKeyConfig); err != nil {
+		t.Fatalf("UpdateProviderKeyWithReadTokens: %v", err)
+	}
+
+	inMemory := storedProviderKey(t, config, "key-1").OAuthKeyConfig
+	if inMemory.AccessToken.GetValue() != "access-login" || inMemory.RefreshToken.GetValue() != "refresh-login" {
+		t.Fatalf("tokens = %q/%q, want the new pair", inMemory.AccessToken.GetValue(), inMemory.RefreshToken.GetValue())
+	}
+	if inMemory.ExpiresAt != "" {
+		t.Fatalf("expiry = %q, want empty; the stored deadline belongs to the replaced token", inMemory.ExpiresAt)
 	}
 }
 

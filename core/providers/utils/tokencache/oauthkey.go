@@ -109,6 +109,27 @@ func minterForConfig(cfg *schemas.OAuthKeyConfig, hc *http.Client, onRotate func
 	}
 }
 
+// InvalidateForConfig drops the cached token for cfg so the next Resolve mints one from scratch.
+// It is the entry point for a caller that has just learned from the upstream that a token it was
+// served is no longer accepted — a revoked-but-unexpired access token, which the cache would
+// otherwise keep serving until its own expiry. The cache key is derived here because its fields
+// are unexported; a config that cannot be resolved to a key is a no-op, since nothing could have
+// been cached under it.
+//
+// The slot and its failure backoff stay, deliberately: a retry after an upstream 401 mints once,
+// and a credential that keeps being refused then waits out the backoff instead of minting on
+// every request.
+func InvalidateForConfig(cache *Cache[string], cfg *schemas.OAuthKeyConfig) {
+	if cache == nil || cfg == nil {
+		return
+	}
+	cacheKey, bErr := validateConfig(cfg)
+	if bErr != nil {
+		return
+	}
+	cache.Invalidate(cacheKey)
+}
+
 // validateConfig runs the allocation-free shape checks every request pays for and returns the
 // credential's cache key. Grant-specific checks that need more than a nil test live in
 // MinterForConfig, on the cold path.

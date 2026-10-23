@@ -477,18 +477,25 @@ const isLiteralHTTPSOrLoopbackURL = (v: { value?: string; ref?: string; type?: s
 };
 
 // A browser-login expiry is stored verbatim and parsed by the server with time.Parse(time.RFC3339),
-// so the form rejects what that layout cannot read. Go accepts fractional seconds and gives the
-// zone offset no range check, so neither is enforced here; the calendar date is, because Go
-// rejects 2026-02-30 and a form that lets it through would 400 on save.
+// so the form rejects what that layout cannot read. Go accepts fractional seconds, so those are
+// allowed; the calendar date and the zone offset are checked because Go rejects 2026-02-30 and
+// "time zone offset hour out of range", and a form that let either through would 400 on save.
 //
 // The value is matched untrimmed on purpose: the server parses the stored string as it arrives,
 // so a padded " 2026-10-22T12:00:00Z " must fail here rather than at save.
-const RFC3339_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+const RFC3339_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-](\d{2}):(\d{2}))$/;
 const isRFC3339 = (value: string): boolean => {
 	const match = RFC3339_PATTERN.exec(value);
 	if (!match) return false;
 	const [year, month, day, hour, minute, second] = match.slice(1, 7).map(Number);
 	if (month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59) return false;
+	// A zone offset is a clock offset, so both fields keep their natural range: RFC3339 allows
+	// 00-23 hours and 00-59 minutes. Go's parser rejects the hour above 24 but happily folds 60
+	// minutes into the next hour, and the server would store whatever it accepted; bounding both
+	// here is what keeps a value that passes the form from 400ing on save.
+	const offsetHour = match[7];
+	const offsetMinute = match[8];
+	if (offsetHour !== undefined && (Number(offsetHour) > 23 || Number(offsetMinute) > 59)) return false;
 	// The month length is computed from the leap-year rule rather than with Date.UTC, which maps
 	// years 0-99 to 1900-1999; Go's time.Parse has no such quirk and rejects 2026-02-30.
 	const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;

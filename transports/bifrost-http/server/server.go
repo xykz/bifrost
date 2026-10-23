@@ -338,6 +338,10 @@ type BifrostHTTPServer struct {
 	// directly rather than through the HTTP handler.
 	agentGatewayManager    *agent.Manager
 	agentGatewayGRPCServer *handlers.AgentGatewayGRPCServer
+
+	// codeBuddyCredentialUninstall clears the process-wide CodeBuddy rotation sink installed at
+	// boot. It runs from both shutdown paths, and is nil when registration never got that far.
+	codeBuddyCredentialUninstall func()
 }
 
 var logger schemas.Logger
@@ -2940,8 +2944,10 @@ func (s *BifrostHTTPServer) RegisterAPIRoutes(ctx context.Context, callbacks Ser
 	providerHandler := handlers.NewProviderHandler(callbacks, s.Config, s.Client)
 	// The CodeBuddy credential sink is process-wide and needs the config store, so it is installed
 	// here, once, where the provider handler that exposes the key routes is built. Without it a
-	// browser_login refresh would discard the rotated refresh token.
-	handlers.InstallCodeBuddyCredentialSink(s.Config)
+	// browser_login refresh would discard the rotated refresh token. The uninstall runs from the
+	// shutdown path so a second server in the same process (tests, an embedded host) does not keep
+	// writing rotations into this server's config after it has stopped.
+	s.codeBuddyCredentialUninstall = handlers.InstallCodeBuddyCredentialSink(s.Config)
 	oauthHandler := handlers.NewOAuthHandler(s.Config.OAuthProvider, s.Client, s.Config)
 	mcpHandler := handlers.NewMCPHandler(callbacks, callbacks, s.Client, s.Config, oauthHandler, callbacks)
 	// Virtual MCP routes read the config store on every call; skip them when persistence is disabled
@@ -3823,6 +3829,10 @@ func (s *BifrostHTTPServer) Start() error {
 				logger.Info("closing websocket connection pool...")
 				s.wsPool.Close()
 			}
+			// Clearing the process-wide CodeBuddy rotation sink belongs with the rest of the
+			// teardown: leaving it installed would let a second server in this process inherit a
+			// sink that writes into this one's config.
+			s.uninstallCodeBuddyCredentialSink()
 			// Cleanup Config and all its background components
 			if s.Config != nil {
 				s.Config.Close(shutdownCtx)
@@ -3864,4 +3874,15 @@ func (s *BifrostHTTPServer) cleanupAfterServeError() {
 	if s.skillsServingHandler != nil {
 		s.skillsServingHandler.Close()
 	}
+	s.uninstallCodeBuddyCredentialSink()
+}
+
+// uninstallCodeBuddyCredentialSink clears the process-wide rotation sink, at most once per server.
+// Both shutdown paths call it, and neither order guarantees the other has not run.
+func (s *BifrostHTTPServer) uninstallCodeBuddyCredentialSink() {
+	if s.codeBuddyCredentialUninstall == nil {
+		return
+	}
+	s.codeBuddyCredentialUninstall()
+	s.codeBuddyCredentialUninstall = nil
 }

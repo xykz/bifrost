@@ -38,15 +38,23 @@ const POPUP_BLOCKED_MESSAGE = "Your browser blocked the sign-in window. Allow po
 const START_FAILED_MESSAGE = "Could not start the CodeBuddy sign-in. Try again.";
 const TIMEOUT_MESSAGE = "The CodeBuddy sign-in timed out. Try again.";
 const FAILED_MESSAGE = "The CodeBuddy sign-in did not complete. Try again.";
+const EXPIRED_MESSAGE = "The CodeBuddy sign-in expired. Try again.";
 
 // errorMessage keeps a message the caller already turned into one (the modal wraps RTK's
 // FetchBaseQueryError with getErrorMessage) and falls back to an actionable sentence otherwise.
-const errorMessage = (error: unknown): string => {
-	if (error && typeof error === "object" && "message" in error) {
-		const message = (error as { message?: unknown }).message;
-		if (typeof message === "string" && message.trim()) return message;
+const errorMessage = (error: unknown): string => errorMessageOr(error, START_FAILED_MESSAGE);
+
+// errorMessageOr is errorMessage with a caller-chosen fallback. It understands the RTK error shape
+// the modal's poll returns (a bare FetchBaseQueryError has status and data, no message), so a
+// server-sent detail wins over the fallback sentence.
+const errorMessageOr = (error: unknown, fallback: string): string => {
+	if (error && typeof error === "object") {
+		const candidate = error as { message?: unknown; data?: { error?: { message?: unknown }; message?: unknown } };
+		if (typeof candidate.message === "string" && candidate.message.trim()) return candidate.message;
+		const fromBody = candidate.data?.error?.message ?? candidate.data?.message;
+		if (typeof fromBody === "string" && fromBody.trim()) return fromBody;
 	}
-	return START_FAILED_MESSAGE;
+	return fallback;
 };
 
 const deadlineOf = (flowExpiresAt: string): number => {
@@ -55,20 +63,43 @@ const deadlineOf = (flowExpiresAt: string): number => {
 };
 
 // A single poll's meaning, with the transport flattened out: a rejected poll is not an outcome
-// (the server still owns the flow), so it reads as pending alongside the upstream's own pending
-// answer. The caller owns the deadline and the lifecycle.
+// unless the rejection is the server saying the flow is gone. A 5xx or a network failure means the
+// gateway could not answer this tick, and the flow is still alive server-side, so it reads as
+// pending alongside the upstream's own pending answer. A 4xx is terminal: the flow expired or was
+// already settled (404), and no further tick can complete it, so waiting out the 15-minute deadline
+// would leave the dialog spinning over a flow that no longer exists.
 export type CodeBuddyPollOutcome =
 	| { kind: "pending" }
 	| { kind: "completed"; result: CodeBuddyLoginResult }
 	| { kind: "failed"; error: string };
 
+// isTerminalPollStatus reports whether a rejected poll means the flow is gone rather than
+// temporarily unreachable. 4xx is the server refusing the flow id itself; 5xx and anything with no
+// status (a transport failure) stay transient, because the gateway may still own the flow.
+const isTerminalPollStatus = (error: unknown): boolean => {
+	if (!error || typeof error !== "object") return false;
+	const status = (error as { status?: unknown }).status;
+	if (typeof status === "number") return status >= 400 && status < 500;
+	// RTK's FetchBaseQueryError carries the status either as a number (FETCH_ERROR, TIMEOUT_ERROR,
+	// PARSING_ERROR) or as a string discriminator ("FETCH_ERROR"); only the numeric form is a real
+	// HTTP answer, and a bare Error from a test or a caller has no status at all.
+	if (typeof status === "string") return false;
+	return false;
+};
+
 export async function pollCodeBuddyLogin(poll: CodeBuddyLoginDeps["poll"], flowId: string): Promise<CodeBuddyPollOutcome> {
 	let status: CodeBuddyLoginStatus;
 	try {
 		status = await poll(flowId);
-	} catch {
+	} catch (error) {
 		// A 502 from the gateway means the upstream poll failed this once, not that the flow is
 		// dead: the server still owns it and the next tick may well complete it.
+		if (isTerminalPollStatus(error)) {
+			// The server answered about this flow and refused it, so its own message is the useful
+			// one when it sent one; otherwise the dialog says the sign-in expired rather than
+			// repeating a generic "did not complete", which would read as a transient failure.
+			return { kind: "failed", error: errorMessageOr(error, EXPIRED_MESSAGE) };
+		}
 		return { kind: "pending" };
 	}
 	if (status.status === "completed") {

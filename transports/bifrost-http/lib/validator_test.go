@@ -3827,7 +3827,7 @@ func TestSchemaCodeBuddyCNProviderAccepted(t *testing.T) {
 		t.Fatalf("config.json must accept codebuddy-cn as a provider key: %v", err)
 	}
 
-	t.Run("declared next to github-copilot with the plain provider shape", func(t *testing.T) {
+	t.Run("declared next to github-copilot with the shared provider shape plus its own key", func(t *testing.T) {
 		schema := loadSchema(t)
 		entry, found := navigateJSON(schema, "properties", "providers", "properties", "codebuddy-cn")
 		if !found {
@@ -3837,8 +3837,19 @@ func TestSchemaCodeBuddyCNProviderAccepted(t *testing.T) {
 		if !ok {
 			t.Fatalf("codebuddy-cn entry should be an object, got %T", entry)
 		}
-		if ref, _ := obj["$ref"].(string); ref != "#/$defs/provider" {
-			t.Errorf("codebuddy-cn should $ref #/$defs/provider, got %q", ref)
+		// The entry keeps the shared provider shape — so every provider-level setting stays
+		// available — and narrows only `keys`, because the exactly-one-credential rule cannot be
+		// stated on base_key without applying it to every provider.
+		allOf, ok := obj["allOf"].([]interface{})
+		if !ok || len(allOf) != 2 {
+			t.Fatalf("codebuddy-cn should be an allOf of the provider shape and its key override, got %v", obj)
+		}
+		if ref, _ := allOf[0].(map[string]interface{})["$ref"].(string); ref != "#/$defs/provider" {
+			t.Errorf("codebuddy-cn should keep $ref #/$defs/provider, got %q", ref)
+		}
+		keyRef, found := navigateJSON(schema, "properties", "providers", "properties", "codebuddy-cn", "allOf", 1, "properties", "keys", "items", "$ref")
+		if !found || keyRef != "#/$defs/codebuddy_cn_key" {
+			t.Errorf("codebuddy-cn keys should $ref #/$defs/codebuddy_cn_key, got %v", keyRef)
 		}
 	})
 
@@ -3846,6 +3857,64 @@ func TestSchemaCodeBuddyCNProviderAccepted(t *testing.T) {
 		// The entry must not be so permissive that a provider without keys slips through.
 		if err := validateConfig(t, compiled, `{"providers": {"codebuddy-cn": {"keys": []}}}`); err == nil {
 			t.Error("an empty keys list must be rejected for codebuddy-cn")
+		}
+	})
+}
+
+// TestSchemaCodeBuddyCNAuthModeIsExactlyOne pins the config.json half of the exactly-one-auth-mode
+// rule. A codebuddy-cn key authenticates with either a pasted API key (X-API-Key) or a
+// browser_login bundle (Authorization); resolveKey prefers the value, so both would silently ignore
+// the login, and neither leaves a key that can never authenticate. The management API refuses both
+// shapes (handlers.validateProviderKeyURL) and lib.processProvider now refuses them too, so the
+// schema has to reject them rather than letting a hand-edited config.json boot a dead key.
+func TestSchemaCodeBuddyCNAuthModeIsExactlyOne(t *testing.T) {
+	compiled := compileSchema(t)
+
+	key := func(body string) string {
+		return fmt.Sprintf(`{"providers": {"codebuddy-cn": {"keys": [{%s}]}}}`, body)
+	}
+	const oauth = `"oauth_key_config": {"grant_type": "browser_login", "token_url": "https://copilot.tencent.com/v2/plugin/auth/token/refresh", "refresh_token": "env.CODEBUDDY_REFRESH_TOKEN"}`
+
+	valid := []struct {
+		name   string
+		config string
+	}{
+		{"pasted value alone", key(`"name": "k", "value": "env.CODEBUDDY_CN_API_KEY", "models": ["*"], "weight": 1.0`)},
+		{"browser_login bundle alone", key(`"name": "k", "models": ["*"], "weight": 1.0, ` + oauth)},
+	}
+	for _, tt := range valid {
+		t.Run("valid: "+tt.name, func(t *testing.T) {
+			if err := validateConfig(t, compiled, tt.config); err != nil {
+				t.Fatalf("config should be valid: %v", err)
+			}
+		})
+	}
+
+	invalid := []struct {
+		name   string
+		config string
+	}{
+		{"neither credential", key(`"name": "k", "models": ["*"], "weight": 1.0`)},
+		{"empty value and no bundle", key(`"name": "k", "value": "", "models": ["*"], "weight": 1.0`)},
+		{"both credentials", key(`"name": "k", "value": "sk-pasted", "models": ["*"], "weight": 1.0, ` + oauth)},
+		// The provider resolves only browser_login, so any other grant is a dead key too.
+		{"a grant the provider cannot use", key(`"name": "k", "models": ["*"], "weight": 1.0, "oauth_key_config": {"grant_type": "client_credentials", "token_url": "https://idp.example/token", "client_id": "id", "client_secret": "secret"}`)},
+	}
+	for _, tt := range invalid {
+		t.Run("invalid: "+tt.name, func(t *testing.T) {
+			if err := validateConfig(t, compiled, tt.config); err == nil {
+				t.Fatal("config should be invalid")
+			}
+		})
+	}
+
+	// The rule must not leak: another provider's key may still carry both, which is what the
+	// shared base_key has always allowed and what the github-copilot shape relies on.
+	t.Run("other providers are untouched", func(t *testing.T) {
+		cfg := `{"providers": {"openai": {"keys": [{"name": "k", "value": "sk", "models": ["*"], "weight": 1.0,
+			"oauth_key_config": {"grant_type": "client_credentials", "token_url": "https://idp.example/token", "client_id": "id", "client_secret": "secret"}}]}}}`
+		if err := validateConfig(t, compiled, cfg); err != nil {
+			t.Fatalf("the codebuddy-cn key rule must not narrow any other provider: %v", err)
 		}
 	})
 }

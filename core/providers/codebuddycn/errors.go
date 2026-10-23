@@ -80,7 +80,8 @@ func readEnvelope(body []byte) (code int, detail string) {
 // A 401 or the dead-token code is a permanent credential fault and pins the status to 401 with
 // fallbacks blocked; everything else is 502 and retriable. httpStatus is the status the response
 // carried, used to spot a rejected credential and to phrase the message when the envelope said
-// nothing.
+// nothing. A retried condition says so in the message: a 502 from a refused model would otherwise
+// read as a gateway outage rather than the transient upstream answer the spec treats it as.
 func applyEnvelope(bifrostErr *schemas.BifrostError, code int, detail string, httpStatus int) {
 	if bifrostErr.Error == nil {
 		bifrostErr.Error = &schemas.ErrorField{}
@@ -99,16 +100,27 @@ func applyEnvelope(bifrostErr *schemas.BifrostError, code int, detail string, ht
 
 	switch {
 	case detail != "" && code != 0:
-		bifrostErr.Error.Message = fmt.Sprintf("codebuddy-cn: %s (code %d)", detail, code)
+		bifrostErr.Error.Message = fmt.Sprintf("codebuddy-cn: %s (code %d)%s", detail, code, transientNote(code, dead))
 	case detail != "":
 		bifrostErr.Error.Message = "codebuddy-cn: " + detail
 	case code != 0:
-		bifrostErr.Error.Message = fmt.Sprintf("codebuddy-cn: the provider returned code %d without a message", code)
+		bifrostErr.Error.Message = fmt.Sprintf("codebuddy-cn: the provider returned code %d without a message%s", code, transientNote(code, dead))
 	case dead:
 		bifrostErr.Error.Message = "codebuddy-cn: the credential was rejected (401); re-authenticate the key"
 	default:
 		bifrostErr.Error.Message = fmt.Sprintf("codebuddy-cn: the provider returned status %d without a message", httpStatus)
 	}
+}
+
+// transientNote explains, in one short clause, why a non-401 answer with a gateway code is being
+// retried rather than treated as a permanent fault. Without it the 502 reads as an infrastructure
+// failure, so an operator cannot tell a model-availability refusal the spec says to retry from an
+// outage — and the retries look like a gateway problem rather than the ruling they are.
+func transientNote(code int, dead bool) string {
+	if dead || code == 0 {
+		return ""
+	}
+	return "; transient, retrying"
 }
 
 // envelopeError reports whether a response body is a gateway failure envelope rather than a

@@ -20,8 +20,10 @@ package codebuddycn
 
 import (
 	"context"
+	"encoding/json"
 	"maps"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -255,8 +257,11 @@ func (p *CodeBuddyCNProvider) GetProviderKey() schemas.ModelProvider {
 // in X-API-Key and the editor headers must ride along on the listing too.
 func (p *CodeBuddyCNProvider) ListModels(ctx *schemas.BifrostContext, keys []schemas.Key, request *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
 	unfiltered := request != nil && request.Unfiltered
-	// With no keys there is no credential to list with, and the pinned catalog is still a true
-	// answer for the provider.
+	// The gateway never reaches this branch: core's getAllSupportedKeys fails a ListModels request
+	// before any provider method runs when a keyed provider has no usable keys, and codebuddy-cn is
+	// keyed. A direct caller of the Provider interface — a Go SDK integration, or a caller inside
+	// core that resolves keys itself — can still pass an empty slice, and for those the pinned
+	// catalog is the right answer rather than a "no key" error, so the branch stays.
 	if len(keys) == 0 {
 		return providerUtils.HandleKeylessListModelsRequest(p.GetProviderKey(), func() (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
 			return catalogListModelsResponse(schemas.WhiteList{"*"}, nil, nil, unfiltered), nil
@@ -266,9 +271,13 @@ func (p *CodeBuddyCNProvider) ListModels(ctx *schemas.BifrostContext, keys []sch
 }
 
 // listModelsByKey fetches the live catalogue for one key and filters it through the standard
-// list-models pipeline so the key's allowlist, blacklist and aliases apply. A 404 means the
-// gateway serves no catalogue, so the pinned one answers instead; any other failure is the
-// caller's to see.
+// list-models pipeline so the key's allowlist, blacklist and aliases apply.
+//
+// The pinned catalog answers whenever the live listing cannot be produced: the gateway serves no
+// catalogue today (404), and a 200 whose body the shared converter cannot read carries no model
+// information either — an HTML interstitial or a maintenance page is not a decode bug the caller
+// can act on. Any other failure is reported, because a 5xx or a rejected credential is a real
+// upstream condition the caller should see rather than have masked by a static list.
 func (p *CodeBuddyCNProvider) listModelsByKey(ctx *schemas.BifrostContext, key schemas.Key, request *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
 	resolved, bErr := p.resolveKey(ctx, key)
 	if bErr != nil {
@@ -295,16 +304,18 @@ func (p *CodeBuddyCNProvider) listModelsByKey(ctx *schemas.BifrostContext, key s
 	}
 	ctx.SetValue(schemas.BifrostContextKeyProviderResponseHeaders, providerUtils.ExtractProviderResponseHeaders(resp))
 
+	// Read the body before branching on status so the catalog answer can record it exactly as the
+	// live-listing path does; a decode failure here is itself a "no listing" answer.
+	body, bodyErr := providerUtils.CheckAndDecodeBody(resp)
+
 	if resp.StatusCode() == fasthttp.StatusNotFound {
-		return catalogListModelsResponse(key.Models, key.BlacklistedModels, key.Aliases, request.Unfiltered), nil
+		return p.catalogResponse(key, request, latency, body), nil
 	}
 	if resp.StatusCode() != fasthttp.StatusOK {
 		return nil, providerUtils.SetErrorLatency(parseError(resp), latency)
 	}
-
-	body, decodeErr := providerUtils.CheckAndDecodeBody(resp)
-	if decodeErr != nil {
-		return nil, providerUtils.NewBifrostOperationError(schemas.ErrProviderResponseDecode, decodeErr)
+	if bodyErr != nil {
+		return p.catalogResponse(key, request, latency, body), nil
 	}
 	listing := &openai.OpenAIListModelsResponse{}
 	_, rawResponse, bErr := providerUtils.HandleProviderResponse(
@@ -312,7 +323,7 @@ func (p *CodeBuddyCNProvider) listModelsByKey(ctx *schemas.BifrostContext, key s
 		providerUtils.ShouldSendBackRawResponse(ctx, p.sendBackRawResponse),
 	)
 	if bErr != nil {
-		return nil, providerUtils.SetErrorLatency(bErr, latency)
+		return p.catalogResponse(key, request, latency, body), nil
 	}
 
 	response := listing.ToBifrostListModelsResponse(p.GetProviderKey(), key.Models, key.BlacklistedModels, key.Aliases, request.Unfiltered)
@@ -321,17 +332,51 @@ func (p *CodeBuddyCNProvider) listModelsByKey(ctx *schemas.BifrostContext, key s
 	return response, nil
 }
 
+// catalogResponse renders the pinned catalog as one key's answer, recording the same latency, raw
+// body and response headers a live listing records. Without that the catalog answer would be
+// invisible in the logs that show how long the listing took and what the upstream actually sent,
+// which is precisely the question asked when a deployment's model picker disagrees with the
+// catalog.
+func (p *CodeBuddyCNProvider) catalogResponse(key schemas.Key, request *schemas.BifrostListModelsRequest, latency time.Duration, body []byte) *schemas.BifrostListModelsResponse {
+	unfiltered := request != nil && request.Unfiltered
+	response := catalogListModelsResponse(key.Models, key.BlacklistedModels, key.Aliases, unfiltered)
+	response.ExtraFields.Latency = latency.Milliseconds()
+	if len(body) > 0 && p.sendBackRawResponse {
+		// json.RawMessage, not []byte: a plain byte slice marshals as base64, which would put a
+		// different value on the wire than the live-listing path writes for the same field.
+		response.ExtraFields.RawResponse = json.RawMessage(body)
+	}
+	return response
+}
+
 // ChatCompletion performs a chat completion request to the CodeBuddy API. The caller's stream
 // flag is passed through unchanged: the official CLI constructs both shapes, so the gateway
 // accepts both and nothing is forced or aggregated here.
+//
+// A 401 on a browser_login key is retried once after the credential is invalidated, because the
+// upstream can revoke an access token before the expiry it declared. See retryOnUnauthorized.
 func (p *CodeBuddyCNProvider) ChatCompletion(ctx *schemas.BifrostContext, key schemas.Key, request *schemas.BifrostChatRequest) (*schemas.BifrostChatResponse, *schemas.BifrostError) {
+	response, sent, bErr := p.chatCompletion(ctx, key, request)
+	if sent && bErr != nil {
+		if retriedKey, ok := p.retryOnUnauthorized(key, bErr); ok {
+			response, _, bErr = p.chatCompletion(ctx, retriedKey, request)
+		}
+	}
+	return response, bErr
+}
+
+// chatCompletion is one unary attempt: resolve the credential, then send. sent reports whether the
+// request reached the upstream, which is what makes a 401 retryable — a failure to resolve the
+// credential has already been through the mint, and retrying it would hit the token endpoint again
+// for an answer that cannot have changed.
+func (p *CodeBuddyCNProvider) chatCompletion(ctx *schemas.BifrostContext, key schemas.Key, request *schemas.BifrostChatRequest) (*schemas.BifrostChatResponse, bool, *schemas.BifrostError) {
 	resolved, bErr := p.resolveKey(ctx, key)
 	if bErr != nil {
-		return nil, bErr
+		return nil, false, bErr
 	}
 	// authHeaderFor takes the key as configured plus the minted token separately: the resolved copy
 	// holds that token in Value, which would then read as a pasted key and be sent in X-API-Key.
-	return openai.HandleOpenAIChatCompletionRequest(
+	response, bErr := openai.HandleOpenAIChatCompletionRequest(
 		ctx,
 		p.client,
 		p.networkConfig.BaseURL+providerUtils.GetPathFromContext(ctx, chatCompletionsPath),
@@ -346,18 +391,98 @@ func (p *CodeBuddyCNProvider) ChatCompletion(ctx *schemas.BifrostContext, key sc
 		nil,
 		p.logger,
 	)
+	return response, true, bErr
+}
+
+// retryOnUnauthorized decides whether one failed chat attempt should be re-minted and retried, and
+// returns the key the retry must use. It reports false for anything that is not a 401 on a
+// browser_login bundle, so the pasted-key path and every other provider failure are untouched.
+//
+// The fast path in resolveKey is what makes this necessary: it serves the stored access token for
+// as long as the expiry says it is fresh, and nothing told that path the upstream had revoked the
+// token early. Both places that can keep serving it are cleared — the token cache, and the stored
+// access token the config holds — so the retry mints from the refresh token. The stored token is
+// cleared through the credential sink rather than a second writer, and before the mint, so the
+// mint's own rotation is what ends up persisted.
+//
+// Exactly one retry is possible: the caller makes this decision once per request, and a second 401
+// is returned with AllowFallbacks false, which is the spec's permanent-credential ruling.
+func (p *CodeBuddyCNProvider) retryOnUnauthorized(key schemas.Key, bErr *schemas.BifrostError) (schemas.Key, bool) {
+	if bErr == nil || bErr.StatusCode == nil || *bErr.StatusCode != http.StatusUnauthorized {
+		return key, false
+	}
+	// 12153 is the durable refresh token being dead, not the access token. A re-mint cannot repair
+	// that, and clearing the stored access token would drop a credential that may still be good.
+	if bErr.Error != nil && bErr.Error.Code != nil && *bErr.Error.Code == strconv.Itoa(deadRefreshTokenCode) {
+		return key, false
+	}
+	if key.OAuthKeyConfig == nil || key.OAuthKeyConfig.GrantType != schemas.OAuthGrantBrowserLogin {
+		return key, false
+	}
+	// A pasted value wins over the bundle in resolveKey, so a 401 there is about that value, not
+	// about a minted token this code owns.
+	if strings.TrimSpace(key.Value.GetValue()) != "" {
+		return key, false
+	}
+	p.invalidateBrowserLoginCredential(key)
+	// The cache was just invalidated, so the fast path would still read the stored token off this
+	// copy of the key. Dropping it from the retry's key makes the mint unconditional, which is the
+	// point of the invalidate: the credential that was refused must not be offered again.
+	retry := key
+	cfg := *key.OAuthKeyConfig
+	cfg.AccessToken = nil
+	cfg.ExpiresAt = ""
+	retry.OAuthKeyConfig = &cfg
+	return retry, true
+}
+
+// invalidateBrowserLoginCredential drops the cached access token for a browser_login key and asks
+// the credential sink to clear the stored one. Both are best-effort: with no sink installed (a Go
+// SDK caller) only the cache can be cleared, and the retry still mints because its key copy carries
+// no stored token.
+//
+// The sink is reused rather than a second write path: it is already the one owner of "persist this
+// credential", including the store write and the in-memory update that the next request reads.
+func (p *CodeBuddyCNProvider) invalidateBrowserLoginCredential(key schemas.Key) {
+	tokencache.InvalidateForConfig(p.tokens, key.OAuthKeyConfig)
+	if key.OAuthKeyConfig == nil {
+		return
+	}
+	sink := currentCredentialSink()
+	if sink == nil {
+		return
+	}
+	// An empty access token and an empty expiry: the refresh token stays, and the empty expiry asks
+	// applyProviderKeyTokens to leave the stored value alone. What is being written is the absence
+	// of a token, not a token.
+	sink(p.GetProviderKey(), key.ID, "", key.OAuthKeyConfig.RefreshToken.GetValue(), "")
 }
 
 // ChatCompletionStream performs a streaming chat completion request to the CodeBuddy API.
 // It supports real-time streaming of responses using Server-Sent Events (SSE).
 // Uses CodeBuddy's OpenAI-compatible streaming format.
 // Returns a channel containing BifrostStreamChunk objects representing the stream or an error if the request fails.
+//
+// A 401 arrives before the first chunk, so the same one-shot re-mint the unary path does applies
+// here too: nothing has been sent to the caller yet.
 func (p *CodeBuddyCNProvider) ChatCompletionStream(ctx *schemas.BifrostContext, postHookRunner schemas.PostHookRunner, postHookSpanFinalizer func(context.Context), key schemas.Key, request *schemas.BifrostChatRequest) (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+	stream, sent, bErr := p.chatCompletionStream(ctx, postHookRunner, postHookSpanFinalizer, key, request)
+	if sent && bErr != nil {
+		if retriedKey, ok := p.retryOnUnauthorized(key, bErr); ok {
+			stream, _, bErr = p.chatCompletionStream(ctx, postHookRunner, postHookSpanFinalizer, retriedKey, request)
+		}
+	}
+	return stream, bErr
+}
+
+// chatCompletionStream is one streaming attempt: resolve the credential, then send. sent means the
+// same thing it does on the unary path.
+func (p *CodeBuddyCNProvider) chatCompletionStream(ctx *schemas.BifrostContext, postHookRunner schemas.PostHookRunner, postHookSpanFinalizer func(context.Context), key schemas.Key, request *schemas.BifrostChatRequest) (chan *schemas.BifrostStreamChunk, bool, *schemas.BifrostError) {
 	resolved, bErr := p.resolveKey(ctx, key)
 	if bErr != nil {
-		return nil, bErr
+		return nil, false, bErr
 	}
-	return openai.HandleOpenAIChatCompletionStreaming(
+	stream, bErr := openai.HandleOpenAIChatCompletionStreaming(
 		ctx,
 		p.streamingClient,
 		p.networkConfig.BaseURL+providerUtils.GetPathFromContext(ctx, chatCompletionsPath),
@@ -378,6 +503,7 @@ func (p *CodeBuddyCNProvider) ChatCompletionStream(ctx *schemas.BifrostContext, 
 		p.logger,
 		postHookSpanFinalizer,
 	)
+	return stream, true, bErr
 }
 
 // ModelRetrieve is not supported by the CodeBuddy CN provider.

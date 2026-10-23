@@ -226,6 +226,85 @@ describe("startCodeBuddyLogin", () => {
 		expect(popup.closeCount).toBe(1);
 	});
 
+	// The server refusing the flow id is terminal: the flow expired or was already settled, so no
+	// later tick can complete it. Treating a 4xx as transient left the dialog pending until the
+	// 15-minute deadline while the server had nothing left to poll.
+	it("surfaces a 4xx poll as a terminal failure instead of waiting out the deadline", async () => {
+		const popup = makePopup();
+		const onResult = vi.fn();
+		let polls = 0;
+
+		startCodeBuddyLogin(
+			deps({
+				openPopup: () => popup,
+				onResult,
+				poll: () => {
+					polls += 1;
+					// RTK's shape for a 404: status plus the parsed body, no top-level message.
+					return Promise.reject({ status: 404, data: { error: { message: "login flow not found" } } });
+				},
+			}),
+		);
+
+		await flush();
+		await tick(1);
+
+		expect(polls, "a terminal poll must not be retried").toBe(1);
+		expect(onResult).toHaveBeenCalledTimes(1);
+		const outcome = onResult.mock.calls[0][0] as { error?: string };
+		expect(outcome.error).toBe("login flow not found");
+		expect(popup.closeCount).toBe(1);
+
+		await tick(5);
+		expect(polls).toBe(1);
+	});
+
+	it("falls back to an expiry message for a 4xx with no body message", async () => {
+		const popup = makePopup();
+		const onResult = vi.fn();
+
+		startCodeBuddyLogin(
+			deps({
+				openPopup: () => popup,
+				onResult,
+				poll: () => Promise.reject({ status: 410 }),
+			}),
+		);
+
+		await flush();
+		await tick(1);
+
+		expect(onResult).toHaveBeenCalledTimes(1);
+		const outcome = onResult.mock.calls[0][0] as { error?: string };
+		expect(outcome.error).toMatch(/expired/i);
+		expect(popup.closeCount).toBe(1);
+	});
+
+	// 5xx stays transient: the gateway could not answer this tick, but the flow is still alive.
+	it("keeps polling after a 5xx", async () => {
+		const popup = makePopup();
+		const onResult = vi.fn();
+		let polls = 0;
+
+		startCodeBuddyLogin(
+			deps({
+				openPopup: () => popup,
+				onResult,
+				poll: () => {
+					polls += 1;
+					if (polls === 1) return Promise.reject({ status: 502, data: { error: { message: "upstream failed" } } });
+					return Promise.resolve(COMPLETED);
+				},
+			}),
+		);
+
+		await flush();
+		await tick(2);
+
+		expect(polls).toBe(2);
+		expect(onResult).toHaveBeenCalledWith(RESULT);
+	});
+
 	it("gives up when the flow deadline passes", async () => {
 		const popup = makePopup();
 		const onResult = vi.fn();

@@ -24129,6 +24129,82 @@ func TestLoadConfig_ClientConfigSyncPreservesClientMetadata(t *testing.T) {
 	assert.Equal(t, true, metadata["onboarding_dismissed"])
 }
 
+// TestProcessProviderEnforcesCodeBuddyCNAuthMode pins the Go half of Important 2: config.schema.json
+// now refuses a codebuddy-cn key with both credentials or neither, but config.json is not always
+// schema-validated (a hand-edited file, a deployment that pins an older $schema URL), so the load
+// path has to refuse the same shapes. Without it such a key boots and only fails at request time
+// with an unauthenticated call.
+func TestProcessProviderEnforcesCodeBuddyCNAuthMode(t *testing.T) {
+	oauth := func() *schemas.OAuthKeyConfig {
+		return &schemas.OAuthKeyConfig{
+			GrantType:    schemas.OAuthGrantBrowserLogin,
+			TokenURL:     *schemas.NewSecretVar("https://copilot.tencent.com/v2/plugin/auth/token/refresh"),
+			RefreshToken: schemas.NewSecretVar("refresh-1"),
+		}
+	}
+	// A reference-only value is the documented env-backed shape: NewSecretVar leaves Val empty when
+	// the variable is unset in this process, and the key is still well formed.
+	envValue := *schemas.NewSecretVar("env.BIFROST_TEST_CODEBUDDY_CN_UNSET")
+
+	valid := []struct {
+		name string
+		key  schemas.Key
+	}{
+		{"pasted value alone", schemas.Key{Name: "k", Value: *schemas.NewSecretVar("sk-pasted")}},
+		{"env-backed value alone", schemas.Key{Name: "k", Value: envValue}},
+		{"browser_login bundle alone", schemas.Key{Name: "k", OAuthKeyConfig: oauth()}},
+	}
+	for _, tt := range valid {
+		t.Run("valid: "+tt.name, func(t *testing.T) {
+			cfg := configstore.ProviderConfig{Keys: []schemas.Key{tt.key}}
+			require.NoError(t, processProvider(nil, "codebuddy-cn", cfg, map[schemas.ModelProvider]configstore.ProviderConfig{}))
+		})
+	}
+
+	invalid := []struct {
+		name string
+		key  schemas.Key
+	}{
+		{"neither credential", schemas.Key{Name: "k"}},
+		{"both credentials", schemas.Key{Name: "k", Value: *schemas.NewSecretVar("sk-pasted"), OAuthKeyConfig: oauth()}},
+		{"a grant the provider cannot use", schemas.Key{Name: "k", OAuthKeyConfig: func() *schemas.OAuthKeyConfig {
+			c := oauth()
+			c.GrantType = schemas.OAuthGrantClientCredentials
+			c.ClientID = schemas.NewSecretVar("id")
+			c.ClientSecret = schemas.NewSecretVar("secret")
+			c.RefreshToken = nil
+			return c
+		}()}},
+	}
+	for _, tt := range invalid {
+		t.Run("invalid: "+tt.name, func(t *testing.T) {
+			cfg := configstore.ProviderConfig{Keys: []schemas.Key{tt.key}}
+			err := processProvider(nil, "codebuddy-cn", cfg, map[schemas.ModelProvider]configstore.ProviderConfig{})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "codebuddy-cn")
+		})
+	}
+
+	// The rule is the provider's own, so another provider's key is unaffected.
+	t.Run("other providers are untouched", func(t *testing.T) {
+		cfg := configstore.ProviderConfig{Keys: []schemas.Key{{Name: "k"}}}
+		require.NoError(t, processProvider(nil, "openai", cfg, map[schemas.ModelProvider]configstore.ProviderConfig{}))
+	})
+}
+
+// TestProcessAuthoritativeProviderRejectsCodeBuddyCNAuthMode pins the same rule on the
+// source_of_truth=config.json path, which writes the file through rather than merging it. There the
+// key is not merely skipped: an unusable row would become the stored one.
+func TestProcessAuthoritativeProviderRejectsCodeBuddyCNAuthMode(t *testing.T) {
+	cfg := configstore.ProviderConfig{Keys: []schemas.Key{{Name: "k"}}}
+	err := processAuthoritativeProvider("codebuddy-cn", cfg, configstore.ProviderConfig{}, false, map[schemas.ModelProvider]configstore.ProviderConfig{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "codebuddy-cn")
+
+	ok := configstore.ProviderConfig{Keys: []schemas.Key{{Name: "k", Value: *schemas.NewSecretVar("sk-pasted")}}}
+	require.NoError(t, processAuthoritativeProvider("codebuddy-cn", ok, configstore.ProviderConfig{}, false, map[schemas.ModelProvider]configstore.ProviderConfig{}))
+}
+
 // TestValidateCustomProvider_BaseProviderTypes pins which base_provider_type
 // values config.json and the store accept for a custom provider: typesafe is a
 // supported base (keyed or keyless), vertex is not.

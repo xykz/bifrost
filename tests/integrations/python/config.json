@@ -650,6 +650,23 @@
         "default_request_timeout_in_seconds": 300
       }
     },
+    "codebuddy-cn": {
+      "send_back_raw_request": true,
+      "send_back_raw_response": true,
+      "store_raw_request_response": true,
+      "keys": [
+        {
+          "name": "CodeBuddy CN API Key",
+          "value": "env.CODEBUDDY_CN_API_KEY",
+          "weight": 1,
+          "models": ["*"],
+          "use_for_batch_api": false
+        }
+      ],
+      "network_config": {
+        "default_request_timeout_in_seconds": 300
+      }
+    },
     "anthropic_pc_auto": {
       "send_back_raw_request": true,
       "send_back_raw_response": true,

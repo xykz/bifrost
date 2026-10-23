@@ -731,7 +731,23 @@
           "$ref": "#/$defs/provider_with_github_copilot_config"
         },
         "codebuddy-cn": {
-          "$ref": "#/$defs/provider"
+          "allOf": [
+            {
+              "$ref": "#/$defs/provider"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "keys": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/codebuddy_cn_key"
+                  },
+                  "minItems": 1
+                }
+              }
+            }
+          ]
         }
       },
       "additionalProperties": true
@@ -7429,6 +7445,48 @@
             {
               "required": [
                 "github_copilot_key_config"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "codebuddy_cn_key": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/base_key"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "oauth_key_config": {
+              "type": "object",
+              "properties": {
+                "grant_type": {
+                  "const": "browser_login"
+                }
+              },
+              "required": [
+                "grant_type"
+              ]
+            }
+          }
+        },
+        {
+          "oneOf": [
+            {
+              "properties": {
+                "value": {
+                  "minLength": 1
+                }
+              },
+              "required": [
+                "value"
+              ]
+            },
+            {
+              "required": [
+                "oauth_key_config"
               ]
             }
           ]

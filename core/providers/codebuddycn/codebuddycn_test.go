@@ -739,6 +739,62 @@ func TestListModelsFallsBackToThePinnedCatalog(t *testing.T) {
 	}
 }
 
+// A 200 carrying something the shared converter cannot read is not a decode error the caller can
+// act on: the body says nothing about the models this deployment serves, and the pinned catalog is
+// still a true answer. This used to surface as a decode error, which turned a reachable provider
+// into a broken model picker.
+func TestListModelsFallsBackToThePinnedCatalogOnAnUnreadableBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<html><body>maintenance</body></html>`))
+	}))
+	defer server.Close()
+
+	p := newTestProvider(t, server.URL)
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	keys := []schemas.Key{{Value: *schemas.NewSecretVar("sk-pasted"), Models: schemas.WhiteList{"*"}}}
+
+	response, bErr := p.ListModels(ctx, keys, &schemas.BifrostListModelsRequest{})
+	require.Nil(t, bErr)
+	require.NotEmpty(t, response.Data, "the pinned catalog must answer instead of a decode error")
+	for _, model := range response.Data {
+		require.Contains(t, model.ID, string(schemas.CodeBuddyCN)+"/")
+	}
+}
+
+// The catalog answer must be indistinguishable from a live listing in the logs: the latency field,
+// the captured raw body and the recorded response headers all have to be filled in. Without that the
+// one branch that answers from a static list is the one branch an operator cannot see.
+func TestCatalogAnswerRecordsTheSameTelemetryAsALiveListing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Slow enough that a recorded latency cannot be mistaken for the zero value.
+		time.Sleep(15 * time.Millisecond)
+		w.Header().Set("X-Upstream-Trace", "trace-1")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"message":"not found"}`))
+	}))
+	defer server.Close()
+
+	config := &schemas.ProviderConfig{
+		NetworkConfig:       schemas.NetworkConfig{DefaultRequestTimeoutInSeconds: 30, BaseURL: server.URL},
+		SendBackRawResponse: true,
+	}
+	p, err := NewCodeBuddyCNProvider(config, &testLogger{})
+	require.NoError(t, err)
+
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	keys := []schemas.Key{{Value: *schemas.NewSecretVar("sk-pasted"), Models: schemas.WhiteList{"*"}}}
+
+	response, bErr := p.ListModels(ctx, keys, &schemas.BifrostListModelsRequest{})
+	require.Nil(t, bErr)
+	require.NotEmpty(t, response.Data)
+	require.GreaterOrEqual(t, response.ExtraFields.Latency, int64(10), "the catalog branch must record the upstream latency")
+
+	headers, ok := ctx.Value(schemas.BifrostContextKeyProviderResponseHeaders).(map[string]string)
+	require.True(t, ok, "the upstream response headers must be recorded on the catalog branch too")
+	require.Equal(t, "trace-1", headers["X-Upstream-Trace"])
+}
+
 // A live listing that fails for any other reason is reported rather than masked by the catalog.
 func TestListModelsReportsNonMissingCatalogueErrors(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -789,7 +845,17 @@ func TestParseErrorClassifiesDeadCredentials(t *testing.T) {
 			body:        `{"code":40001,"msg":"model not available"}`,
 			wantStatus:  http.StatusBadGateway,
 			wantCode:    schemas.Ptr("40001"),
-			wantMessage: "codebuddy-cn: model not available (code 40001)",
+			wantMessage: "codebuddy-cn: model not available (code 40001); transient, retrying",
+		},
+		{
+			// The same shape on a real non-200: the 502 must still say it is being retried, so an
+			// operator can tell a refused model from an outage.
+			name:        "a 400 with a transient code says it is retried",
+			status:      http.StatusBadRequest,
+			body:        `{"code":40002,"msg":"model not available"}`,
+			wantStatus:  http.StatusBadGateway,
+			wantCode:    schemas.Ptr("40002"),
+			wantMessage: "codebuddy-cn: model not available (code 40002); transient, retrying",
 		},
 		{
 			name:        "bare message envelope",
@@ -833,7 +899,295 @@ func TestParseErrorClassifiesDeadCredentials(t *testing.T) {
 	}
 }
 
-// A pasted value is served as-is and never reaches the token endpoint.
+// TestChatCompletionRetriesOnceAfterARevokedAccessToken is Important 5's reproduction. The fast path
+// in resolveKey serves the stored access token until the expiry it declared, so a token the upstream
+// revoked early fails every request for up to 24h. A 401 on a browser_login key must invalidate the
+// credential and re-mint exactly once, and the retry must succeed.
+func TestChatCompletionRetriesOnceAfterARevokedAccessToken(t *testing.T) {
+	var mu sync.Mutex
+	refreshes := 0
+	chatCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.URL.Path {
+		case "/v2/plugin/auth/token/refresh":
+			refreshes++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"code":0,"data":{"accessToken":"access-2","refreshToken":"refresh-2","expiresIn":3600}}`))
+		case "/v2/chat/completions":
+			chatCalls++
+			// The first token was revoked upstream: the first call is refused, the minted one works.
+			if r.Header.Get("Authorization") != "Bearer access-2" {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"message":"token revoked"}`))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"hunyuan-chat","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	p := newTestProvider(t, server.URL)
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	// The stored token claims to be fresh, which is exactly the case the fast path trusts and the
+	// upstream has already revoked.
+	key := schemas.Key{ID: "key-1", OAuthKeyConfig: &schemas.OAuthKeyConfig{
+		GrantType:    schemas.OAuthGrantBrowserLogin,
+		TokenURL:     *schemas.NewSecretVar(server.URL + "/v2/plugin/auth/token/refresh"),
+		AccessToken:  schemas.NewSecretVar("access-revoked"),
+		RefreshToken: schemas.NewSecretVar("refresh-1"),
+		ExpiresAt:    time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+	}}
+
+	response, bErr := p.ChatCompletion(ctx, key, chatRequest())
+	require.Nil(t, bErr)
+	require.NotNil(t, response)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, 1, refreshes, "a 401 must mint exactly once, not once per request")
+	require.Equal(t, 2, chatCalls, "the request must be retried exactly once")
+}
+
+// TestChatCompletionDoesNotLoopWhenTheRetryIsAlsoRefused pins the bound: a 401 that persists after
+// the re-mint is surfaced with fallbacks blocked, and no second retry happens.
+func TestChatCompletionDoesNotLoopWhenTheRetryIsAlsoRefused(t *testing.T) {
+	var mu sync.Mutex
+	refreshes := 0
+	chatCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.URL.Path {
+		case "/v2/plugin/auth/token/refresh":
+			refreshes++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"code":0,"data":{"accessToken":"access-2","refreshToken":"refresh-2","expiresIn":3600}}`))
+		case "/v2/chat/completions":
+			chatCalls++
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"message":"still refused"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	p := newTestProvider(t, server.URL)
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	key := schemas.Key{ID: "key-1", OAuthKeyConfig: &schemas.OAuthKeyConfig{
+		GrantType:    schemas.OAuthGrantBrowserLogin,
+		TokenURL:     *schemas.NewSecretVar(server.URL + "/v2/plugin/auth/token/refresh"),
+		AccessToken:  schemas.NewSecretVar("access-revoked"),
+		RefreshToken: schemas.NewSecretVar("refresh-1"),
+		ExpiresAt:    time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+	}}
+
+	_, bErr := p.ChatCompletion(ctx, key, chatRequest())
+	require.NotNil(t, bErr)
+	require.NotNil(t, bErr.StatusCode)
+	require.Equal(t, http.StatusUnauthorized, *bErr.StatusCode)
+	require.NotNil(t, bErr.AllowFallbacks)
+	require.False(t, *bErr.AllowFallbacks, "a 401 that survives the re-mint is still permanent")
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, 1, refreshes)
+	require.Equal(t, 2, chatCalls, "exactly one retry: a loop would keep calling")
+}
+
+// TestChatCompletionDoesNotRetryADeadRefreshToken: code 12153 means the durable credential is gone.
+// A re-mint cannot repair it, and clearing the stored access token would drop one that may still be
+// good, so the permanent 401 must be surfaced as-is.
+func TestChatCompletionDoesNotRetryADeadRefreshToken(t *testing.T) {
+	var mu sync.Mutex
+	chatCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		chatCalls++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":12153,"msg":"refresh token invalid"}`))
+	}))
+	defer server.Close()
+
+	sink := &rotationSink{}
+	SetCredentialSink(sink.install())
+	t.Cleanup(func() { SetCredentialSink(nil) })
+
+	p := newTestProvider(t, server.URL)
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	key := schemas.Key{ID: "key-1", OAuthKeyConfig: &schemas.OAuthKeyConfig{
+		GrantType:    schemas.OAuthGrantBrowserLogin,
+		TokenURL:     *schemas.NewSecretVar(server.URL + "/v2/plugin/auth/token/refresh"),
+		AccessToken:  schemas.NewSecretVar("access-1"),
+		RefreshToken: schemas.NewSecretVar("refresh-1"),
+		ExpiresAt:    time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+	}}
+
+	_, bErr := p.ChatCompletion(ctx, key, chatRequest())
+	require.NotNil(t, bErr)
+	require.Equal(t, http.StatusUnauthorized, *bErr.StatusCode)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, 1, chatCalls, "a dead refresh token must not be retried")
+	calls, _, _, _, _, _, _ := sink.snapshot()
+	require.Equal(t, 0, calls, "a dead refresh token must not clear the stored access token")
+}
+
+// A 401 on a pasted key is about that value, not about a minted token, so it must not re-mint or
+// touch the credential sink.
+func TestChatCompletionDoesNotRetryAPastedKey401(t *testing.T) {
+	var mu sync.Mutex
+	chatCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		chatCalls++
+		mu.Unlock()
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"message":"bad key"}`))
+	}))
+	defer server.Close()
+
+	sink := &rotationSink{}
+	SetCredentialSink(sink.install())
+	t.Cleanup(func() { SetCredentialSink(nil) })
+
+	p := newTestProvider(t, server.URL)
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	key := schemas.Key{Value: *schemas.NewSecretVar("sk-pasted")}
+
+	_, bErr := p.ChatCompletion(ctx, key, chatRequest())
+	require.NotNil(t, bErr)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, 1, chatCalls)
+	calls, _, _, _, _, _, _ := sink.snapshot()
+	require.Equal(t, 0, calls, "a pasted key must not invalidate a browser_login credential")
+}
+
+// The streaming path is the same wire and the same 401: a refused token before the first chunk
+// must be re-minted once, not surfaced to the caller.
+func TestChatCompletionStreamRetriesOnceAfterARevokedAccessToken(t *testing.T) {
+	var mu sync.Mutex
+	refreshes := 0
+	chatCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.URL.Path {
+		case "/v2/plugin/auth/token/refresh":
+			refreshes++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"code":0,"data":{"accessToken":"access-2","refreshToken":"refresh-2","expiresIn":3600}}`))
+		case "/v2/chat/completions":
+			chatCalls++
+			if r.Header.Get("Authorization") != "Bearer access-2" {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"message":"token revoked"}`))
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	p := newTestProvider(t, server.URL)
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	key := schemas.Key{ID: "key-1", OAuthKeyConfig: &schemas.OAuthKeyConfig{
+		GrantType:    schemas.OAuthGrantBrowserLogin,
+		TokenURL:     *schemas.NewSecretVar(server.URL + "/v2/plugin/auth/token/refresh"),
+		AccessToken:  schemas.NewSecretVar("access-revoked"),
+		RefreshToken: schemas.NewSecretVar("refresh-1"),
+		ExpiresAt:    time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+	}}
+
+	stream, bErr := p.ChatCompletionStream(ctx, func(ctx *schemas.BifrostContext, result *schemas.BifrostResponse, err *schemas.BifrostError) (*schemas.BifrostResponse, *schemas.BifrostError) {
+		return result, err
+	}, nil, key, chatRequest())
+	require.Nil(t, bErr)
+	require.NotNil(t, stream)
+	for range stream {
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, 1, refreshes)
+	require.Equal(t, 2, chatCalls)
+}
+
+// A 401 on a browser_login key must also clear the stored access token, or the next request reads
+// it off the key row and the fast path serves the revoked credential again until its expiry.
+func TestUnauthorizedInvalidationClearsTheStoredAccessToken(t *testing.T) {
+	var mu sync.Mutex
+	chatCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.URL.Path {
+		case "/v2/plugin/auth/token/refresh":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"code":0,"data":{"accessToken":"access-2","refreshToken":"refresh-2","expiresIn":3600}}`))
+		case "/v2/chat/completions":
+			chatCalls++
+			if r.Header.Get("Authorization") != "Bearer access-2" {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"message":"token revoked"}`))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"hunyuan-chat","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`))
+		}
+	}))
+	defer server.Close()
+
+	var sinkMu sync.Mutex
+	type write struct{ access, refresh, expiresAt string }
+	var writes []write
+	SetCredentialSink(func(provider schemas.ModelProvider, keyID, accessToken, refreshToken, expiresAt string) {
+		sinkMu.Lock()
+		defer sinkMu.Unlock()
+		writes = append(writes, write{accessToken, refreshToken, expiresAt})
+	})
+	t.Cleanup(func() { SetCredentialSink(nil) })
+
+	p := newTestProvider(t, server.URL)
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	key := schemas.Key{ID: "key-1", OAuthKeyConfig: &schemas.OAuthKeyConfig{
+		GrantType:    schemas.OAuthGrantBrowserLogin,
+		TokenURL:     *schemas.NewSecretVar(server.URL + "/v2/plugin/auth/token/refresh"),
+		AccessToken:  schemas.NewSecretVar("access-revoked"),
+		RefreshToken: schemas.NewSecretVar("refresh-1"),
+		ExpiresAt:    time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+	}}
+
+	_, bErr := p.ChatCompletion(ctx, key, chatRequest())
+	require.Nil(t, bErr)
+
+	mu.Lock()
+	require.Equal(t, 2, chatCalls)
+	mu.Unlock()
+
+	sinkMu.Lock()
+	defer sinkMu.Unlock()
+	require.Len(t, writes, 2, "the refused token must be cleared through the sink, then the rotation written")
+	require.Equal(t, "", writes[0].access, "the first write clears the token the upstream refused")
+	require.Equal(t, "refresh-1", writes[0].refresh, "the durable credential must survive the clear")
+	require.Equal(t, "access-2", writes[1].access, "the minted rotation is then written")
+	require.Equal(t, "refresh-2", writes[1].refresh)
+}
+
+// A pasted key is served as-is and never reaches the token endpoint.
 func TestResolveKeyLeavesPastedValuesAlone(t *testing.T) {
 	p := newTestProvider(t, "")
 	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)

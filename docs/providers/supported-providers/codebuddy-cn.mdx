@@ -254,6 +254,12 @@ and once that window elapses the next request retries the refresh. The classific
 how often the token endpoint is hit; it does not stop the retries, so the failed requests keep
 recurring in your request metrics until the key is re-authenticated. Nothing recovers on its own.
 
+A chat request refused with `401` is a different case: the upstream can revoke an access token
+before the expiry it declared, so the key still looks fresh to the stored-token fast path. That
+`401` invalidates the credential — the cached token and the stored access token are both dropped —
+and the request is retried once with a freshly minted token, which succeeds if only the old token
+was revoked. If the retry is refused too, the `401` is surfaced with fallbacks blocked, as above.
+
 ### Re-authenticating a dead refresh token
 
 When the refresh token dies, requests on that key fail with a `401` whose message says the refresh
@@ -396,11 +402,18 @@ the upstream list changes.
 **Code**: `parseError` in `core/providers/codebuddycn/errors.go`; `deadRefreshTokenError` in `core/providers/utils/tokencache/browserlogin.go`
 </Accordion>
 
+<Accordion title="Revoked Access Token Costs One Retry">
+**Severity**: Low
+**Behavior**: A chat `401` on a browser_login key invalidates the cached and stored access token and retries the request once with a freshly minted one
+**Impact**: A token the upstream revoked before its declared expiry is replaced within the same request instead of failing for the rest of that expiry window (bounded by the 24h cap). The retry is bounded to one; a `401` that survives the re-mint is still permanent and still blocks fallbacks
+**Code**: `retryOnUnauthorized` in `core/providers/codebuddycn/codebuddycn.go`
+</Accordion>
+
 <Accordion title="Static Model Catalog">
 **Severity**: Low
-**Behavior**: List Models answers from the pinned catalog (`hunyuan-chat`, `deepseek-v3`, `glm-5.2`) when the live listing is unavailable
+**Behavior**: List Models answers from the pinned catalog (`hunyuan-chat`, `deepseek-v3`, `glm-5.2`) when the live listing is unavailable — a `404` (the gateway serves no catalogue today) or a `200` the shared converter cannot read. Any other failure, such as a `5xx` or a rejected credential, is reported rather than masked
 **Impact**: The picker can lag behind the models Tencent adds; chat requests are unaffected because unknown ids pass through
-**Code**: `codeBuddyCatalog` and `catalogListModelsResponse` in `core/providers/codebuddycn/models.go`
+**Code**: `codeBuddyCatalog` and `catalogListModelsResponse` in `core/providers/codebuddycn/models.go`; `listModelsByKey` in `core/providers/codebuddycn/codebuddycn.go`
 </Accordion>
 
 <Accordion title="Login Requires an Admin Session">

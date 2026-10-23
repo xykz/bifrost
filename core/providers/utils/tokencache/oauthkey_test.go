@@ -43,6 +43,37 @@ func TestResolveBearer(t *testing.T) {
 		assert.Empty(t, h)
 	})
 
+	t.Run("InvalidateForConfig drops the cached token so the next resolve mints", func(t *testing.T) {
+		ts := newTokenServer(t)
+		cache := New[string](Options{})
+		cfg := ccConfig(ts.URL)
+
+		_, bErr := ResolveBearerFrom(context.Background(), cache, *cfg, authClient(t))
+		require.Nil(t, bErr)
+		hits, _, _, _, _ := ts.snapshot()
+		assert.Equal(t, 1, hits, "the first resolve mints")
+
+		// A second resolve with nothing invalidated reuses the cached entry.
+		_, bErr = ResolveBearerFrom(context.Background(), cache, *cfg, authClient(t))
+		require.Nil(t, bErr)
+		hits, _, _, _, _ = ts.snapshot()
+		assert.Equal(t, 1, hits)
+
+		InvalidateForConfig(cache, cfg)
+		_, bErr = ResolveBearerFrom(context.Background(), cache, *cfg, authClient(t))
+		require.Nil(t, bErr)
+		hits, _, _, _, _ = ts.snapshot()
+		assert.Equal(t, 2, hits, "an invalidated credential must be minted again")
+	})
+
+	t.Run("InvalidateForConfig is a no-op for a nil cache or config", func(t *testing.T) {
+		// The contract is a plain function, so it has to tolerate the callers that reach it with
+		// nothing to do rather than panicking on the inference path.
+		InvalidateForConfig(nil, nil)
+		InvalidateForConfig(New[string](Options{}), nil)
+		InvalidateForConfig(nil, &schemas.OAuthKeyConfig{})
+	})
+
 	t.Run("mints once and reuses across calls", func(t *testing.T) {
 		ts := newTokenServer(t)
 		cache := New[string](Options{})

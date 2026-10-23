@@ -1167,7 +1167,7 @@ func validateProviderKeyURL(provider schemas.ModelProvider, key schemas.Key) err
 	// is removed and the key falls back to credentials that were never valid.
 	if cfg := key.OAuthKeyConfig; cfg != nil {
 		if !bifrost.ProviderSupportsOAuthKeyConfig(provider) {
-			return fmt.Errorf("oauth_key_config is only supported on openai and on custom providers whose base_provider_type is openai")
+			return fmt.Errorf("oauth_key_config is only supported on openai, on codebuddy-cn, and on custom providers whose base_provider_type is openai")
 		}
 		if err := cfg.Validate(); err != nil {
 			return err

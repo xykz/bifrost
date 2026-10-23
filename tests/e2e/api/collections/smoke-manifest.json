@@ -1,7 +1,7 @@
 {
   "$schema_note": "Curated smoke selection for `make run-provider-harness-test SMOKE=1`. Rows are matched by (folder, name) against the AUGMENTED collection (tmp/harness-augmented.json), because the cache-parity rows are generated at augment time and do not exist in provider-harness.json. `folder` is the immediate parent folder and is REQUIRED, not advisory: the criss-cross rows are named after their model, so a bare name like `gemini/gemini-2.5-flash` matches 25 requests. Selecting a request pulls in its chained-variable producers automatically (filter-collection.mjs expandWithProducers), so the effective request count can exceed the count here. Rows claimed by more than one provider partition run once per fork, same as in a full sweep.",
-  "budget": 104,
-  "total_selected": 104,
+  "budget": 105,
+  "total_selected": 105,
   "pillars": [
     {
       "key": "attachments",
@@ -382,6 +382,10 @@
         {
           "folder": "8.2.A Native /v1/chat/completions streaming × all providers",
           "name": "gemini/gemini-2.5-flash"
+        },
+        {
+          "folder": "8.2.A Native /v1/chat/completions streaming × all providers",
+          "name": "codebuddy-cn/hunyuan-chat"
         },
         {
           "folder": "8.3.H Native /v1/embeddings × all providers",

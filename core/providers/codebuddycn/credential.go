@@ -27,7 +27,9 @@ var credentialSink atomic.Pointer[CredentialSink]
 // at boot from the transport; passing nil is what tests and a bare Go SDK caller leave in place,
 // and it means rotations are simply not persisted.
 //
-// Installing twice replaces the previous sink, so a test that installs one must clear it again.
+// Installing twice replaces the previous sink. A caller that owns the install should prefer
+// HasCredentialSink before doing so and its returned uninstall on shutdown, or two servers in one
+// process end up sharing whichever sink booted last.
 func SetCredentialSink(fn func(provider schemas.ModelProvider, keyID, accessToken, refreshToken, expiresAt string)) {
 	if fn == nil {
 		credentialSink.Store(nil)
@@ -44,4 +46,11 @@ func currentCredentialSink() CredentialSink {
 		return *sink
 	}
 	return nil
+}
+
+// HasCredentialSink reports whether a sink is currently installed. It exists so the transport can
+// tell a first install from a replacement: replacing one silently is what makes two servers in one
+// process (or a leaked test) share whichever sink booted last.
+func HasCredentialSink() bool {
+	return credentialSink.Load() != nil
 }
