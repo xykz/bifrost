@@ -12,17 +12,23 @@ name: Build Dynamic Bifrost Image
 # ghcr.io/<owner>/bifrost:<tag>。镜像内额外带 nodejs/npm 与 python3/pip/uv，
 # 供 STDIO MCP server 使用。
 #
-# 用法（GitHub Actions 手动触发）：
-#   - ref:     源码 ref，默认 feature/dynamic-link-plugins-2.3.2（基于
-#              transports/v2.3.2，Go 1.27.3）。注意 ref 指向的 commit 上必须已存在
-#              transports/Dockerfile.dynamic；历史 tag 本身不含该文件，可改用包含它的
-#              分支，镜像 version 仍手填目标版本。
-#   - version: 版本号，不带 v 前缀，例如 2.3.2-dynamic。镜像 tag 与
-#              main.Version 均由 workflow 加 v 前缀拼成 v<version>。
+# 两种触发方式：
+#
+#   1) 打 tag（不需要本文件出现在默认分支 dev 上）：
+#        git tag dynamic-image-v2.3.2-dynamic && git push origin dynamic-image-v2.3.2-dynamic
+#      GitHub 对 push 事件取的是"被推 ref 上"的 workflow 文件，所以 tag 所在
+#      commit 有这个文件就能跑。版本号从 tag 名去掉 dynamic-image-v 前缀得到，
+#      源码即该 tag 指向的 commit。
+#
+#   2) workflow_dispatch（本文件合入默认分支后才会出现 "Run workflow" 按钮）：
+#      ref 指定源码 ref（tag/分支/sha），version 指定版本号（不带 v 前缀）。
 #
 # 平台仅 linux/amd64；如需 arm64 自行追加。
 
 on:
+  push:
+    tags:
+      - "dynamic-image-v*"
   workflow_dispatch:
     inputs:
       ref:
@@ -38,9 +44,15 @@ permissions:
   contents: read
   packages: write
 
+# 同一个版本不并发构建；重复打 tag 时让新的一次排队而不是互相取消。
+concurrency:
+  group: dynamic-image-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build-push:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       # Same allowlist as the release-pipeline docker-build jobs: the build pulls
       # alpine packages, the Go module proxy, npm packages for the UI stage, and
@@ -64,17 +76,55 @@ jobs:
             registry.npmjs.org:443
             storage.googleapis.com:443
 
+      - name: Resolve source ref and image version
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_REF: ${{ inputs.ref }}
+          DISPATCH_VERSION: ${{ inputs.version }}
+          TAG_NAME: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            ref="$DISPATCH_REF"
+            version="$DISPATCH_VERSION"
+          else
+            # Tag push: build exactly the tagged commit, version from the tag name.
+            ref="$COMMIT_SHA"
+            version="${TAG_NAME#dynamic-image-v}"
+          fi
+
+          if [ -z "$ref" ]; then
+            echo "::error::empty source ref"
+            exit 1
+          fi
+          if [ -z "$version" ]; then
+            echo "::error::empty version (tag must look like dynamic-image-v<version>)"
+            exit 1
+          fi
+          case "$version" in
+            *[!A-Za-z0-9._-]*)
+              echo "::error::version '$version' contains characters not allowed in a docker tag"
+              exit 1
+              ;;
+          esac
+
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building ref $ref as v$version"
+
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ steps.meta.outputs.ref }}
           fetch-depth: 0
           fetch-tags: true
 
       - name: Verify Dockerfile.dynamic exists
         run: |
           test -f transports/Dockerfile.dynamic || {
-            echo "::error::transports/Dockerfile.dynamic not found on ref ${{ inputs.ref }}"
+            echo "::error::transports/Dockerfile.dynamic not found on ref ${{ steps.meta.outputs.ref }}"
             echo "The ref must contain the dynamic Dockerfile (e.g. a branch carrying the change)."
             exit 1
           }
@@ -95,7 +145,7 @@ jobs:
           context: .
           file: ./transports/Dockerfile.dynamic
           build-args: |
-            VERSION=${{ inputs.version }}
+            VERSION=${{ steps.meta.outputs.version }}
           push: true
-          tags: ghcr.io/${{ github.repository }}:v${{ inputs.version }}
+          tags: ghcr.io/${{ github.repository }}:v${{ steps.meta.outputs.version }}
           platforms: linux/amd64
